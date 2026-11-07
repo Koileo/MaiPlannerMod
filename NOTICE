@@ -24,6 +24,13 @@ web/aliases.json 是按曲名整理的社区搜索别名，沿用已有点歌项
 https://github.com/clansty
 数据归原作者和贡献者所有，不作为本项目 MIT 代码重新许可。
 
+## 社区谱面标签
+
+web/community-tags.json 是 DXRating 社区标签快照，源自 https://miruku.dxrating.net/api/v1/dxdata。
+只使用上游明确提供的游戏内部号与谱面难度匹配，不按曲名猜测缺失 ID。
+数据归原作者和社区贡献者所有，不作为本项目 MIT 代码重新许可；来源及上游更新时间保留在 JSON 中。
+可用 node build/update-tags.mjs 刷新快照，运行游戏时不需要联网拉取。
+
 ## 游戏 UI、字体与曲绘
 
 web/ui/、web/fonts/ 中的游戏相关素材及运行时读取的游戏曲绘，其权利归原权利人所有。

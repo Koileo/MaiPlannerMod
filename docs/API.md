@@ -114,13 +114,19 @@ mod 里没有外部脚本链，`chains` 给空对象。前端没有数据同步/
 | GET | `/api/favorites?user=U` · `POST /api/favorite` · `POST /api/favorite/remove` |
 | GET | `/api/blacklist?user=U` · `POST /api/blacklist` · `POST /api/blacklist/remove` |
 | GET | `/api/assistant/state?user=U[&counts=1]` |
-| POST | `/api/assistant/cards` · `/redraw` · `/skip` · `/start` · `/stop` · `/push` · `/settings` |
+| POST | `/api/assistant/cards` · `/redraw` · `/skip` · `/start` · `/stop` · `/push` · `/repush` · `/settings` |
 | GET | `/api/assistant/log` · `/api/assistant/bridge-next` |
 | POST | `/api/assistant/bridge-score` · `/api/assistant/refill` |
 
 成绩回传入口（游戏 → 自身）：`POST /api/assistant/bridge-score` 与 `/api/score`（原始成绩）。
 
 助手内置于 Mod，网页启动时不需要机台 IP、Mod 端口或回传端口。`POST /api/assistant/start` 请求体为 `{"user":"0","mode":"push"}`；只接收成绩用 `mode:"score"`。旧 `/settings` 路由保留兼容。
+
+`start` 要求游戏数据就绪且玩家已登录，推歌模式还要求游戏处于选曲界面并且首曲跳转成功；失败返回 HTTP 409 及 `error` 或 `info` 原因，同时写入助手日志。启动成功返回 `running:true` 和 `mode`，停止成功返回 `running:false`，网页可直接更新状态。
+
+`repush` 请求体为 `{user}`，重新推送当前运行玩家的队首；需已启动推歌模式。`push` 使用与 `/api/jump` 一致的校验和实际跳转结果。
+
+助手状态包含 `profile.rating`（当前登录玩家的游戏 Rating）、`profile.config` 和 `profile.eval`（各为 `{tag,value}` 数组，来自分析计算），并保留卡片 `settings` 和筛选用的 `versions`。玩家列表仅返回 `isEntry:true` 的登录槽位。
 
 `state`、`cards`、`redraw` 和 `skip` 返回的每个 `preview` 条目都包含 `song`：结构与 `/api/song` 的 `song` 相同，但 `sheets` 仅包含抽中的难度，成绩、收藏和分析字段按请求玩家读取。旧队列也在响应时补齐；曲目不存在或难度不可用时 `song` 为 `null`，不会借用 STD/DX 另一张谱面。
 

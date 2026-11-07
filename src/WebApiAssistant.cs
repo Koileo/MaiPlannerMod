@@ -2,7 +2,6 @@
 // 状态：现行。
 using System;
 using System.Collections.Generic;
-using System;
 using System.Globalization;
 using System.Net;
 
@@ -62,27 +61,35 @@ namespace MaiPlanner
                 }
                 case "start":
                 {
-                    var analysis = Analysis.Json(user, true).json;
-                    var result = Assistant.Start(user, QS(q, "mode"), analysis);
+                    var mode = QS(q, "mode");
+                    // 先检查游戏状态，避免无法推歌时仍强制重算整份分析。
+                    string error = !Mod.Ready ? "游戏数据还在加载，请稍后重试"
+                        : PlayerStore.Get(int.Parse(user))?.IsEntry != true ? "请先在机台登录玩家"
+                        : mode == "push" && !SelectDriver.InSelectCached ? "当前不在选曲界面，请回到选曲界面后启动助手"
+                        : null;
+                    if (error != null)
+                    {
+                        Assistant.Log("启动失败：" + error);
+                        Json(ctx, 409, "{\"ok\":false,\"error\":\"" + JsonMini.Esc(error) + "\"}");
+                        return;
+                    }
+                    var analysis = mode == "push" ? Analysis.Json(user, false).json : null;
+                    var result = Assistant.Start(user, mode, analysis);
                     Json(ctx, result.Contains("\"ok\":true") ? 200 : 409, result);
                     return;
                 }
                 case "stop":
                     Json(ctx, 200, Assistant.Stop());
                     return;
-                case "push":
+                case "repush":
                 {
-                    var iid = QInt(q, "internalId", 0);
-                    var cid = QInt(q, "chartid", -1);
-                    if (iid <= 0 || cid < 0)
-                    {
-                        Json(ctx, 400, "{\"ok\":false,\"error\":\"internalId/chartid 不对\"}");
-                        return;
-                    }
-                    var result = SelectDriver.Enqueue(iid, cid, -1);
-                    Json(ctx, 200, "{\"ok\":true,\"info\":\"" + JsonMini.Esc(result ?? "") + "\"}");
+                    var result = Assistant.Repush(user);
+                    Json(ctx, result.Contains("\"ok\":true") ? 200 : 409, result);
                     return;
                 }
+                case "push":
+                    Jump(ctx, q);
+                    return;
                 case "bridge-score":
                 {
                     // 外部（含 ScoreReporter）推过来的原始成绩

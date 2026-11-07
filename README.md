@@ -91,6 +91,10 @@ pwsh -File build/build.ps1 -GameDir "<游戏目录>\Package" -Install
 
 等待曲库加载完成并返回游戏选曲界面。游玩中或连接中断时，页面会暂停点歌，恢复后自动启用。
 
+**点击“启动助手”没有反应？**
+
+更新至 1.0.2，重启游戏并按 Ctrl+F5 刷新网页。按钮下方会立即显示启动进度和结果；若未登录、不在选曲界面、卡池为空或推歌失败，会显示具体原因。调整后可再次启动。
+
 **手机打不开？**
 
 确认使用机台的局域网 IP，检查两台设备的网络和防火墙。手机上的 `127.0.0.1` 指向手机自身，请使用首页提供的扫码地址。
@@ -103,6 +107,7 @@ pwsh -File build/build.ps1 -GameDir "<游戏目录>\Package" -Install
 
 ```powershell
 dotnet run --project verify/VerifyRuntime.csproj -c Release
+dotnet run --project verify/VerifyAssistant.csproj -c Release
 dotnet run --project verify/VerifyLogic.csproj -c Release
 dotnet run --project verify/VerifyStats.csproj -c Release
 dotnet run --project verify/VerifyEndToEnd.csproj -c Release
@@ -124,7 +129,9 @@ node verify/ui-preview.mjs after
 
 默认寻找 Windows 标准安装位置的 Chrome；其他位置可设置 `CHROME_PATH`。验收覆盖登录切换、仅 2P 登录、助手三首预览、无连接参数启动、扫码点歌以及断线恢复。
 
-这些检查不替代真实游戏环境下的跳曲、结算时机和资源解码联调。目前自动结算采样以 1P 为主，双人各自结算与队列顺延仍需实机验证；标签与水鱼差值数据未内置，对应修正默认为 0。
+这些检查不替代真实游戏环境下的跳曲、结算时机和资源解码联调。目前自动结算采样以 1P 为主，双人各自结算与队列顺延仍需实机验证。社区谱面标签已内置，能力图按玩家成绩计算；上游未提供明确内部号的谱面不会猜测标签。水鱼差值数据尚未内置。
+
+开发时可用 `node build/update-tags.mjs` 更新社区标签快照，也可传入已下载的 `/api/v1/dxdata` JSON 文件进行离线构建。`verify/verify-live-profile.ps1` 可从 `-BaseUrl` 读取真实机台的曲库与成绩，在临时目录中验证编译后的画像，不修改机台存档。
 
 ## 更新记录
 

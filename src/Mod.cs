@@ -3,10 +3,10 @@ using System.Reflection;
 using MelonLoader;
 using HarmonyLib;
 
-[assembly: MelonInfo(typeof(MaiPlanner.Mod), "MaiPlannerMod", "1.0.1", "Koileo")]
+[assembly: MelonInfo(typeof(MaiPlanner.Mod), "MaiPlannerMod", "1.0.3", "Koileo")]
 [assembly: MelonGame("sega-interactive", "Sinmai")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.3.0")]
+[assembly: AssemblyFileVersion("1.0.3.0")]
 
 namespace MaiPlanner
 {
@@ -34,6 +34,8 @@ namespace MaiPlanner
             Instance = this;
             MainThread.Init();
             Config.Load();
+            Analysis.TagProvider = CommunityTags.ForChart;
+            Analysis.TagRevision = 1;
             try
             {
                 HarmonyInstance.PatchAll(typeof(Patch_SelectOnStart));

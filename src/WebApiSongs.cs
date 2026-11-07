@@ -427,7 +427,9 @@ namespace MaiPlanner
             var result = SelectDriver.Enqueue(id, diff, kind);
             var superseded = result != null
                 && result.StartsWith(SelectDriver.SupersededPrefix, StringComparison.Ordinal);
-            Json(ctx, 200, "{\"ok\":" + (superseded ? "false" : "true")
+            bool success = result != null && result.StartsWith("已跳转:", StringComparison.Ordinal);
+            Json(ctx, success || superseded ? 200 : 409, "{\"ok\":" + (success ? "true" : "false")
+                + ",\"error\":\"" + JsonMini.Esc(success || superseded ? "" : result ?? "点歌超时，请稍后重试") + "\""
                 + ",\"superseded\":" + (superseded ? "true" : "false")
                 + ",\"internalId\":" + id + ",\"chartid\":" + diff
                 + ",\"msg\":\"" + JsonMini.Esc(result ?? "") + "\"}");

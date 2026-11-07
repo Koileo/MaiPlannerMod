@@ -38,6 +38,7 @@ try {
         $player = New-ModObject 'PlayerStore+Player'
         Set-Field $player 'Index' $index
         Set-Field $player 'IsEntry' $true
+        Set-Field $player 'Rating' (11790 + $index)
         $players.Add($player)
     }
     $override = $assembly.GetType('MaiPlanner.PlayerStore').GetMethods($static) | Where-Object { $_.Name -eq 'Override' -and $_.GetParameters().Count -eq 8 }
@@ -46,7 +47,21 @@ try {
     $parse = $assembly.GetType('MaiPlanner.JsonMini').GetMethod('ParseObj', $static)
     $state = $parse.Invoke($null, @('{"cards":[],"preview":[{"internalId":10146,"chartid":3,"pool":"unplayed"}]}'))
     $serialize = $assembly.GetType('MaiPlanner.Assistant').GetMethod('PreviewJson', $static)
+    $profile = New-ModObject 'AnalysisResult'
+    $byKeyType = $profile.GetType().GetField('ByKey', $instance).FieldType
+    Set-Field $profile 'ByKey' ([Activator]::CreateInstance($byKeyType))
+    $pattern = [Collections.Generic.Dictionary[string,double]]::new()
+    $pattern.Add('转圈', 0.071)
+    $evaluation = [Collections.Generic.Dictionary[string,double]]::new()
+    $evaluation.Add('体力谱', -0.092)
+    Set-Field $profile 'TagUPattern' $pattern
+    Set-Field $profile 'TagUEval' $evaluation
+    $cache = $assembly.GetType('MaiPlanner.Analysis').GetField('_cache', $static).GetValue($null)
+    $cache.Add('1', $profile)
     $data = $serialize.Invoke($null, @('1', $state)) | ConvertFrom-Json
+    Assert ($data.profile.rating -eq 11791) 'Assistant profile returns selected player Rating'
+    Assert ($data.profile.config[0].tag -eq '转圈' -and $data.profile.config[0].value -eq 0.071) 'Assistant returns calculated configuration axes'
+    Assert ($data.profile.eval[0].tag -eq '体力谱' -and $data.profile.eval[0].value -eq -0.092) 'Assistant returns calculated evaluation axes'
     Assert ($data.preview[0].song.internalId -eq 10146) 'Preview includes the exact selected song'
     Assert ($data.preview[0].song.sheets.Count -eq 1 -and $data.preview[0].song.sheets[0].chartid -eq 3) 'Preview contains only the drawn difficulty'
     Assert ($data.preview[0].song.sheets[0].achievement -eq 1005000) '2P preview uses 2P scores instead of 1P'
@@ -55,6 +70,14 @@ try {
     $data = $serialize.Invoke($null, @('1', $state)) | ConvertFrom-Json
     Assert ($null -eq $data.preview[0].song) 'Missing STD chart does not resolve to its DX counterpart'
     Assert ($null -eq $data.preview[1].song) 'Disabled difficulty returns no chart'
+    $tags = $assembly.GetType('MaiPlanner.CommunityTags').GetMethod('ForChart', $static)
+    $resource = $assembly.GetType('MaiPlanner.EmbeddedWeb').GetMethod('ReadText', $static).Invoke($null, @('community-tags.json')) | ConvertFrom-Json
+    Assert (@($resource.charts.PSObject.Properties).Count -gt 1000) 'Community snapshot includes over 1000 tagged charts'
+    $entry = @($resource.charts.PSObject.Properties)[0]
+    $key = $entry.Name.Split(':')
+    $actualTags = $tags.Invoke($null, @([int]$key[0], [int]$key[1]))
+    Assert ($actualTags.Count -eq $entry.Value.Count) 'Embedded tag provider resolves exact game chart'
+    Assert ($tags.Invoke($null, @([int]999999, [int]3)).Count -eq 0) 'Unknown chart has no fabricated tags'
 } finally {
     [Environment]::CurrentDirectory = $previous
     # The sandbox is left in the OS temp directory for inspecting failures.

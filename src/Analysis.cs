@@ -4,10 +4,10 @@
 //
 // 【数据来源差异】mod 里没有 data/fusion/*.json：
 //   曲库走 GameSnapshot.Songs，成绩走 PlayerStore，黑名单走 UserFiles。
-//   社区标签（dxrating.net）与水鱼拟合差值没有内嵌，做成可赋值委托：
-//     TagProvider       —— 返回某张谱的三个组的标签（默认空 → 等价源脚本读不到标签）
+//   社区标签（dxrating.net）通过内嵌快照读取，水鱼拟合差值保留可赋值委托：
+//     TagProvider       —— 返回某张谱的三个组的标签（Mod 初始化时接入 CommunityTags）
 //     FitDiffProvider   —— 返回水鱼 fitDiff / avg / stdDev / cnt / diff（默认空 → 全走纯官标）
-//   接上之前，公式全部生效，只是标签修正为 0、评价定数 = 官标。
+//   未提供水鱼数据时，评价定数从官标及现有标签先验计算。
 //
 // 【跑在哪个线程】只读快照，可在后台线程跑；同一用户同一时刻只允许一份计算（按用户加锁）。
 using System;

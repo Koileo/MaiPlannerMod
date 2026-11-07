@@ -27,6 +27,11 @@ function setMsg(text, kind) {
   if (!el) return;
   el.textContent = text || "";
   el.className = "jumpmsg" + (kind ? " " + kind : "");
+  const assistMessage = $("assist-jump-message");
+  if (assistMessage) {
+    assistMessage.textContent = text || "";
+    assistMessage.className = "jumpmsg" + (kind ? " " + kind : "");
+  }
   el.classList.remove("note-fade");
   clearTimeout(msgTimer);
   if (!text) return;
@@ -122,7 +127,7 @@ function selectRow(row) {
     level: level == null ? null : level,
   };
   // 高亮：新旧卡片一起清（翻页后旧卡片已经不在了，所以按整个列表清）
-  document.querySelectorAll("#song-cards .sc-row.sel, #pool-cards .sc-row.sel")
+  document.querySelectorAll("#song-cards .sc-row.sel, #pool-cards .sc-row.sel, #assist-preview .sc-row.sel")
     .forEach((el) => el.classList.remove("sel"));
   row.classList.add("sel");
   setMsg("", "");
@@ -154,10 +159,10 @@ async function doJump() {
     if (navigator.vibrate) { try { navigator.vibrate(18); } catch (_) { /* 忽略 */ } }
   } catch (err) {
     // 契约里的失败码：409 不在选曲界面、503 数据没加载完、404 没这首
-    const why = err.status === 409 ? "现在不在选曲界面"
+    const why = err.status === 409 ? (err.message || "现在不在选曲界面")
       : err.status === 503 ? "游戏数据还在加载"
         : err.status === 404 ? "曲库里没有这首" : (err.message || "点歌失败");
-    setMsg(why + (err.status === 409 ? "（先进选曲界面）" : ""), "bad");
+    setMsg(why, "bad");
   } finally {
     requesting = false;
     applyStatus(status);
@@ -209,6 +214,7 @@ function attachCardButtons() {
   };
   watch($("song-cards"));
   watch($("pool-cards"));
+  watch($("assist-preview"));
 }
 
 /* ── 二维码 ── */
@@ -275,7 +281,7 @@ export function bindJump() {
 
   // 点难度行 = 选中（不点歌）；点行里的「点歌」按钮 = 选中并立刻点歌；「详情」交给 songcard.js
   document.addEventListener("click", (e) => {
-    const row = e.target.closest("#song-cards .sc-row[data-chartid], #pool-cards .sc-row[data-chartid]");
+    const row = e.target.closest("#song-cards .sc-row[data-chartid], #pool-cards .sc-row[data-chartid], #assist-preview .sc-row[data-chartid]");
     if (!row) return;
     if (row.classList.contains("sc-row-empty") || row.classList.contains("sc-type-row")) return;
     if (e.target.closest(".sc-jump")) return;      // 交给按钮自己处理

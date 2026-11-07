@@ -27,6 +27,7 @@ let LIBMODE = "ready";
 let OFFLINE = false;
 let USERMODE = "1p";
 let RUNNING = false;
+let STARTFAIL = false;
 const STATS = { songs: 0 };
 const TYPES = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8", ".png": "image/png" };
 const json = (r, s, b) => { const u = Buffer.from(JSON.stringify(b)); r.writeHead(s, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }); r.end(u); };
@@ -44,6 +45,7 @@ http.createServer((req, res) => {
   if (p === "/__library") { LIBMODE = u.searchParams.get("mode"); ST.songs = LIBMODE === "empty" ? 0 : SONGS.length; return json(res, 200, { ok: true }); }
   if (p === "/__offline") { OFFLINE = u.searchParams.get("on") === "1"; return json(res, 200, { ok: true }); }
   if (p === "/__users") { USERMODE = u.searchParams.get("mode"); return json(res, 200, { ok: true }); }
+  if (p === "/__assistant") { STARTFAIL = u.searchParams.get("fail") === "1"; return json(res, 200, { ok: true }); }
   if (p === "/__stats") { const b = Buffer.from(JSON.stringify(STATS)); res.writeHead(200); return res.end(b); }
   if (p === "/" || p === "/index.html") return send(res, "index.html");
   if (p === "/scan" || p === "/scan/") return send(res, "scan/index.html");
@@ -68,19 +70,26 @@ http.createServer((req, res) => {
   if (p === "/api/favorites" || p === "/api/blacklist") return json(res, 200, { ok: true, entries: [] });
   if (p === "/api/analysis") return json(res, 200, { charts: [], fitModel: null });
   if (p === "/api/assistant/state") return json(res, 200, {
-    ok: true, running: RUNNING, profile: { rating: 15000, config: [], eval: [] },
+    ok: true, running: RUNNING, profile: { rating: 15000,
+      config: [{tag:"转圈",value:0.07},{tag:"交互",value:-0.08},{tag:"错位",value:0.02}],
+      eval: [{tag:"体力谱",value:0.06},{tag:"高物量",value:0.01},{tag:"底力谱",value:-0.09}] },
     cards: [{ pool: "practice", count: 68 }, { pool: "unplayed", count: 120 }, { pool: "favorite", count: 24 }],
     preview: SONGS.slice(0, 3).map(song => ({ internalId: song.internalId, chartid: 3, poolLabel: "待开荒", song: { ...song, sheets: song.sheets.filter(s => s.chartid === 3) } })), logs: [], settings: {},
   });
   if (p === "/api/assistant/log") return json(res, 200, { ok: true, running: RUNNING, log: "" });
+  if (p === "/api/assistant/repush") return json(res, RUNNING ? 200 : 409, RUNNING
+    ? {ok:true,info:"已跳转: 曲目 1 [DX MASTER]"} : {ok:false,error:"请先启动助手"});
   if (p === "/api/assistant/start" || p === "/api/assistant/stop") {
     let raw = "";
     req.on("data", chunk => raw += chunk);
     req.on("end", () => {
       const body = JSON.parse(raw || "{}");
       if (p.endsWith("/start") && !["push", "score"].includes(body.mode)) return json(res, 409, { ok: false, info: "mode 只能是 push 或 score" });
-      RUNNING = p.endsWith("/start");
-      return json(res, 200, { ok: true, info: "完成" });
+      setTimeout(() => {
+        if (p.endsWith("/start") && STARTFAIL) return json(res, 409, { ok: false, info: "当前不在选曲界面，请回到选曲界面后启动助手" });
+        RUNNING = p.endsWith("/start");
+        return json(res, 200, { ok: true, running: RUNNING, info: "完成" });
+      }, 500);
     });
     return;
   }

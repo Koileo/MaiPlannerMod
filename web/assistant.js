@@ -20,6 +20,10 @@ let POLL_TICK = 0;
 let PLATES = [];
 let SETTINGS_INDEX = -1;
 let LOAD_TOKEN = 0;
+let ACTION_BUSY = false;
+let ACTION_VERSION = 0;
+let ACTION_MESSAGE = "";
+let ACTION_ERROR = false;
 
 function esc(v) {
   return String(v == null ? "" : v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -31,6 +35,8 @@ function currentPage() {
 
 async function loadAssistant() {
   const token = ++LOAD_TOKEN;
+  ACTION_MESSAGE = "";
+  ACTION_ERROR = false;
   const user = currentUser;
   if (!currentUser) {
     ASTATE = null;
@@ -47,11 +53,14 @@ async function loadAssistant() {
     startPoll();
   } catch (err) {
     if (token !== LOAD_TOKEN || user !== currentUser) return;
+    ASTATE = null;
     renderEmpty("打歌助手加载失败：" + err);
   }
 }
 
 function renderEmpty(text) {
+  ACTION_MESSAGE = text;
+  renderStatus();
   const table = document.getElementById("assist-table");
   if (table) table.innerHTML = '<p class="hint">' + esc(text) + "</p>";
   const preview = document.getElementById("assist-preview");
@@ -422,21 +431,29 @@ window.addEventListener("resize", () => {
 function renderStatus() {
   const el = document.getElementById("assist-status");
   if (el) {
-    el.innerHTML = '<span class="dot ' + (ASTATE.running ? "ok" : "") + '"></span>'
-      + (ASTATE.running ? "助手运行中" : "助手待启动");
+    el.innerHTML = '<span class="dot ' + (ASTATE?.running ? "ok" : "") + '"></span>'
+      + (ACTION_BUSY ? "正在处理…" : ASTATE?.running ? "助手运行中" : "助手待启动");
   }
   const start = document.getElementById("assist-start");
   const stop = document.getElementById("assist-stop");
-  if (start) start.disabled = !!ASTATE.running || !(ASTATE.cards || []).length;
+  if (start) {
+    start.disabled = ACTION_BUSY || !!ASTATE?.running || !currentUser || !(ASTATE?.cards || []).length;
+    start.textContent = ACTION_BUSY ? "正在处理…" : "启动助手";
+  }
   const scoreOnly = document.getElementById("assist-start-score");
-  if (scoreOnly) scoreOnly.disabled = !!ASTATE.running;
-  if (stop) stop.disabled = !ASTATE.running;
+  if (scoreOnly) scoreOnly.disabled = ACTION_BUSY || !ASTATE || !currentUser || !!ASTATE.running;
+  if (stop) stop.disabled = ACTION_BUSY || !ASTATE?.running;
+  const message = document.getElementById("assist-message");
+  if (message) {
+    message.textContent = ACTION_MESSAGE || (!currentUser ? "请先在机台登录玩家。" : !(ASTATE?.cards || []).length ? "先添加至少一张曲池卡片，再启动助手。" : "");
+    message.style.color = ACTION_ERROR ? "#e8656b" : "";
+  }
   document.querySelectorAll('.tab[data-page="scores"]').forEach((tab) => {
-    tab.disabled = !!ASTATE.running;
+    tab.disabled = !!ASTATE?.running;
   });
   const hist = document.getElementById("assist-history");
   if (hist) {
-    hist.innerHTML = (ASTATE.logs || []).map((x) =>
+    hist.innerHTML = (ASTATE?.logs || []).map((x) =>
       "<div>" + esc(x.mtime) + " · " + esc(x.name) + "</div>").join("") || "暂无历史日志";
   }
 }
@@ -569,14 +586,36 @@ async function openSettings(index) {
 }
 
 async function act(action, body = {}) {
-  if (!currentUser) return;
+  if (ACTION_BUSY) return;
+  if (!currentUser || !ASTATE) {
+    ACTION_MESSAGE = "请先在机台登录玩家，等待助手加载完成。";
+    renderStatus();
+    return;
+  }
+  const user = currentUser;
+  const token = LOAD_TOKEN;
+  const lifecycle = action === "start" || action === "stop" || action === "repush";
+  if (lifecycle) {
+    ACTION_BUSY = true;
+    ACTION_VERSION += 1;
+    ACTION_ERROR = false;
+    ACTION_MESSAGE = action === "start" ? "正在启动助手，请稍候…" : action === "repush" ? "正在重新推送第一首…" : "正在停止助手…";
+    renderStatus();
+  }
   try {
     const data = await api("/api/assistant/" + action, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user: currentUser, ...body }),
+      body: JSON.stringify({ user, ...body }),
     });
+    if (token !== LOAD_TOKEN || user !== currentUser) return;
     if (data.error) throw new Error(data.error);
-    if (data.cards || data.preview) ASTATE = { ...ASTATE, ...data, log: data.log || ASTATE.log };
+    ASTATE = { ...ASTATE, ...data, log: data.log ?? ASTATE.log };
+    if (lifecycle) {
+      if (typeof data.running !== "boolean" && action !== "repush") ASTATE.running = action === "start";
+      ACTION_MESSAGE = action === "start"
+        ? (body.mode === "score" ? "助手已启动，正在接收成绩。" : "助手已启动，已推送预览中的第一首。")
+        : action === "repush" ? (data.info || "已重新推送第一首。") : "助手已停止。";
+    }
     renderAll();
     if (action === "redraw" && data.empty && !body.force) {
       if (confirm("该卡池已空，是否跳过该卡池并顺延？")) {
@@ -585,25 +624,32 @@ async function act(action, body = {}) {
     }
     return data;
   } catch (err) {
-    if (action === "start") {
-      ASTATE.log = (ASTATE.log || "") + "\n启动失败：" + err;
-      renderLog();
+    if (token !== LOAD_TOKEN || user !== currentUser) return;
+    if (lifecycle) {
+      ACTION_MESSAGE = (action === "start" ? "启动失败：" : action === "repush" ? "重新推送失败：" : "停止失败：") + (err.message || err);
+      ACTION_ERROR = true;
+      ASTATE.log = (ASTATE.log || "") + "\n" + ACTION_MESSAGE;
+      renderLog(true);
     } else {
       alert("操作失败：" + err);
     }
+  } finally {
+    if (lifecycle) ACTION_BUSY = false;
+    renderStatus();
   }
 }
 
 function startPoll() {
   if (POLL) return;
   POLL = setInterval(async () => {
-    if (POLL_BUSY || !ASTATE || !currentUser || currentPage()?.hidden) return;
+    if (POLL_BUSY || ACTION_BUSY || !ASTATE || !currentUser || currentPage()?.hidden) return;
     POLL_BUSY = true;
     const user = currentUser;
     const token = LOAD_TOKEN;
+    const actionVersion = ACTION_VERSION;
     try {
       const data = await api("/api/assistant/log?user=" + encodeURIComponent(user));
-      if (token !== LOAD_TOKEN || user !== currentUser) return;
+      if (ACTION_BUSY || actionVersion !== ACTION_VERSION || token !== LOAD_TOKEN || user !== currentUser) return;
       if (data.log != null) {
         ASTATE.log = data.log;
         const was = ASTATE.running;
@@ -617,17 +663,18 @@ function startPoll() {
       // 预览变化立即拉带数量的状态；平时每 5 个 tick 刷新一次卡池数量。
       if (data.running) {
         const state = await api("/api/assistant/state?user=" + encodeURIComponent(user));
-        if (token !== LOAD_TOKEN || user !== currentUser) return;
+        if (ACTION_BUSY || actionVersion !== ACTION_VERSION || token !== LOAD_TOKEN || user !== currentUser) return;
         const sig = JSON.stringify(state.preview || []);
         POLL_TICK += 1;
         if (sig !== POLL_PREVIEW || POLL_TICK % 5 === 0) {
           POLL_PREVIEW = sig;
           const detailed = await api("/api/assistant/state?user=" + encodeURIComponent(user) + "&counts=1");
-          if (token !== LOAD_TOKEN || user !== currentUser) return;
+          if (ACTION_BUSY || actionVersion !== ACTION_VERSION || token !== LOAD_TOKEN || user !== currentUser) return;
           ASTATE = { ...ASTATE, ...detailed, log: ASTATE.log };
           renderTable();
           renderPreview();
           renderRating();
+          renderRadars();
           renderStatus();
         }
       }

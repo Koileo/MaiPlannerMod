@@ -140,11 +140,31 @@ async function main() {
   check("直接进入助手页会加载牌桌", await until("document.querySelectorAll('#assist-table .assist-card').length === 3"), true);
   check("助手三首预览显示谱面卡片", await until("document.querySelectorAll('#assist-preview .songcard').length === 3"), true);
   check("预览只展示抽中的难度", await ev("[...document.querySelectorAll('#assist-preview .songcard')].every(c => c.querySelectorAll('.sc-row[data-chartid]').length === 1)"), true);
+  check("助手显示真实画像字段中的 Rating", await ev("document.getElementById('assist-rating').textContent.includes('15000')"), true);
+  check("配置与评价能力图均绘制", await ev("document.querySelectorAll('#assist-radar-config svg, #assist-radar-eval svg').length === 2"), true);
+  check("助手每张预览卡都有点歌按钮", await until("document.querySelectorAll('#assist-preview .sc-jump').length === 3"), true);
+  await ev("document.querySelector('#assist-preview .sc-jump').click()");
+  check("预览点歌在助手页内显示机台结果", await until("document.getElementById('assist-jump-message').textContent.includes('已跳转')"), true);
   check("开始打歌无需填写机台 IP 或端口", await ev("!document.querySelector('#assist-host, #assist-mod-port, #assist-callback-port')"), true);
+  await fetch(BASE + "/__assistant?fail=1");
+  await ev("document.getElementById('assist-start').click()");
+  check("点击后立即显示启动中且禁用重复启动", await ev("document.getElementById('assist-start').disabled && document.getElementById('assist-message').textContent.includes('正在启动')"), true);
+  check("启动失败在按钮旁显示原因", await until("document.getElementById('assist-message').textContent.includes('启动失败') && document.getElementById('assist-message').textContent.includes('选曲界面')"), true);
+  await sleep(2600);
+  check("失败原因不会被日志轮询覆盖且可以重试", await ev("document.getElementById('assist-message').textContent.includes('启动失败') && !document.getElementById('assist-start').disabled && document.getElementById('assist-stop').disabled"), true);
+  await fetch(BASE + "/__assistant?fail=0");
   await ev("document.getElementById('assist-start').click()");
   check("无需连接参数即可启动助手", await until("document.getElementById('assist-status').textContent.includes('运行中')"), true);
+  check("启动成功立即显示推歌反馈", await ev("document.getElementById('assist-message').textContent.includes('已推送预览中的第一首') && document.getElementById('assist-start').disabled && !document.getElementById('assist-stop').disabled"), true);
+  await until("!!document.querySelector('[data-act=assist-repush]')");
+  await ev("document.querySelector('[data-act=assist-repush]').click()");
+  check("重新推送调用已实现的接口且保留运行状态", await until("document.getElementById('assist-message').textContent.includes('已跳转') && document.getElementById('assist-status').textContent.includes('运行中')"), true);
   await ev("document.getElementById('assist-stop').click()");
   check("停止助手", await until("document.getElementById('assist-status').textContent.includes('待启动')"), true);
+  await ev("document.getElementById('assist-start-score').click()");
+  check("仅接收成绩立即反馈启动结果", await until("document.getElementById('assist-message').textContent.includes('正在接收成绩') && !document.getElementById('assist-stop').disabled"), true);
+  await ev("document.getElementById('assist-stop').click()");
+  await until("!document.getElementById('assist-start-score').disabled");
   await fetch(BASE + "/__users?mode=none");
   check("退出登录后清除旧玩家", await until("document.querySelectorAll('#user-cards .usercard').length === 0 && document.getElementById('assist-table').textContent.includes('登录')"), true);
   await fetch(BASE + "/__users?mode=2p");
@@ -224,7 +244,7 @@ async function main() {
   }
   console.log("\n" + (CHECKS.length - failed) + "/" + CHECKS.length + " 通过" + (failed ? "，" + failed + " 失败" : ""));
   if (exc.length) console.log("异常：", exc);
-  const unexpected = httpErr.filter((e) => !/404 http:.*\/api\/run$|409 http:.*\/api\/jump$|500 http:.*\/api\/config$|503 http:.*\/api\/(songs|status)(\?.*)?$/.test(e));
+  const unexpected = httpErr.filter((e) => !/404 http:.*\/api\/run$|409 http:.*\/api\/(jump|assistant\/start)$|500 http:.*\/api\/config$|503 http:.*\/api\/(songs|status)(\?.*)?$/.test(e));
   if (unexpected.length) console.log("意外 HTTP 错误：", unexpected);
   process.exitCode = failed ? 1 : 0;
 }

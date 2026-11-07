@@ -310,6 +310,13 @@ namespace MaiPlanner
         // ── 推歌 ──
         internal static bool PushNext(string user)
         {
+            string result;
+            return PushNext(user, out result);
+        }
+
+        private static bool PushNext(string user, out string result)
+        {
+            result = "预览队列为空，请先配置有候选谱面的卡池";
             var state = LoadState(user);
             var preview = Preview(state);
             if (preview.Count == 0)
@@ -323,9 +330,9 @@ namespace MaiPlanner
             }
             var iid = JsonMini.Int(head, "internalId");
             var cid = JsonMini.Int(head, "chartid");
-            var result = SelectDriver.Enqueue(iid, cid, -1);
+            result = SelectDriver.Enqueue(iid, cid, -1) ?? "点歌超时，请确认游戏正常运行并回到选曲界面后重试";
             Log("推送 " + JsonMini.Str(head, "title") + " [" + WebApi.DiffName(cid) + "] → " + (result ?? "?"));
-            return result != null && !result.StartsWith(SelectDriver.SupersededPrefix, StringComparison.Ordinal);
+            return result.StartsWith("已跳转:", StringComparison.Ordinal);
         }
 
         /// <summary>收到成绩：匹配当前预览头则顺延并推下一首</summary>
@@ -392,6 +399,17 @@ namespace MaiPlanner
             sb.Append(",\"running\":").Append(_running ? "true" : "false");
             sb.Append(",\"mode\":\"").Append(JsonMini.Esc(_mode)).Append('"');
             sb.Append(",\"log\":\"").Append(JsonMini.Esc(LogTail())).Append('"');
+            sb.Append(",\"profile\":");
+            AppendProfile(sb, user);
+            sb.Append(",\"versions\":[");
+            bool firstVersion = true;
+            foreach (var version in Versions.Order)
+            {
+                if (!firstVersion) sb.Append(',');
+                firstVersion = false;
+                sb.Append('"').Append(JsonMini.Esc(version)).Append('"');
+            }
+            sb.Append(']');
 
             sb.Append(",\"cards\":[");
             var cards = Cards(state);
@@ -404,6 +422,9 @@ namespace MaiPlanner
                 var card = cards[i] as Dictionary<string, object>;
                 var pool = JsonMini.Str(card, "pool");
                 sb.Append("{\"pool\":\"").Append(JsonMini.Esc(pool)).Append('"')
+                  .Append(",\"settings\":");
+                DumpValue(sb, JsonMini.Obj(card, "settings") ?? new Dictionary<string, object>());
+                sb
                   .Append(",\"poolLabel\":\"").Append(JsonMini.Esc(Label(pool))).Append('"')
                   .Append(",\"count\":").Append(Pools.Count(user, card)).Append('}');
             }
@@ -433,6 +454,43 @@ namespace MaiPlanner
             DumpValue(sb, LoadSettings(user));
             sb.Append('}');
             return sb.ToString();
+        }
+
+        private static void AppendProfile(StringBuilder sb, string user)
+        {
+            int index;
+            var player = int.TryParse(user, out index) ? PlayerStore.Get(index) : null;
+            var analysis = Analysis.Snapshot(user);
+            sb.Append("{\"rating\":").Append(player != null && player.IsEntry
+                ? player.Rating.ToString(CultureInfo.InvariantCulture) : "null");
+            sb.Append(",\"config\":");
+            AppendAxes(sb, analysis?.TagUPattern);
+            sb.Append(",\"eval\":");
+            AppendAxes(sb, analysis?.TagUEval);
+            sb.Append('}');
+        }
+
+        private static void AppendAxes(StringBuilder sb, Dictionary<string, double> axes)
+        {
+            sb.Append('[');
+            bool first = true;
+            if (axes != null) foreach (var axis in axes)
+            {
+                if (!first) sb.Append(',');
+                first = false;
+                sb.Append("{\"tag\":\"").Append(JsonMini.Esc(axis.Key)).Append("\",\"value\":")
+                  .Append(axis.Value.ToString("0.####", CultureInfo.InvariantCulture)).Append('}');
+            }
+            sb.Append(']');
+        }
+
+        internal static string Repush(string user)
+        {
+            if (!_running || _mode != "push" || user != _activeUser)
+                return "{\"ok\":false,\"error\":\"请先启动当前玩家的推歌助手\"}";
+            string result;
+            bool ok = PushNext(user, out result);
+            return "{\"ok\":" + (ok ? "true" : "false") + ",\"info\":\"" + JsonMini.Esc(result) + "\"}";
         }
 
         // ── 路由动作 ──
@@ -480,33 +538,41 @@ namespace MaiPlanner
 
         internal static string Start(string user, string mode, string analysisJson)
         {
+            if (_running)
+            {
+                return StartError("助手已在运行，请先停止助手");
+            }
             if (mode != "push" && mode != "score")
             {
-                return "{\"ok\":false,\"info\":\"mode 只能是 push 或 score\"}";
+                return StartError("mode 只能是 push 或 score");
             }
             var state = LoadState(user);
             if (mode == "push")
             {
                 if (Cards(state).Count == 0)
                 {
-                    return "{\"ok\":false,\"info\":\"至少配置 1 张卡才能启动\"}";
+                    return StartError("至少配置 1 张卡才能启动");
                 }
                 FillPreview(user, state, analysisJson);
                 SaveState(user, state);
                 if (Preview(state).Count == 0)
                 {
-                    return "{\"ok\":false,\"info\":\"所有卡池都是空的\"}";
+                    return StartError("所有卡池都是空的，请调整卡池筛选条件");
                 }
+                string result;
+                if (!PushNext(user, out result)) return StartError(result);
             }
             _activeUser = user;
             _mode = mode;
             _running = true;
             Log(mode == "push" ? "→ 启动（推歌模式）" : "→ 启动（只接成绩）");
-            if (mode == "push")
-            {
-                PushNext(user);
-            }
-            return "{\"ok\":true,\"info\":\"已启动\"}";
+            return "{\"ok\":true,\"running\":true,\"mode\":\"" + mode + "\",\"info\":\"已启动\"}";
+        }
+
+        private static string StartError(string message)
+        {
+            Log("启动失败：" + message);
+            return "{\"ok\":false,\"info\":\"" + JsonMini.Esc(message) + "\"}";
         }
 
         internal static string Stop()
@@ -517,7 +583,7 @@ namespace MaiPlanner
             }
             _running = false;
             Log("→ 已停止");
-            return "{\"ok\":true,\"info\":\"已停止\"}";
+            return "{\"ok\":true,\"running\":false,\"info\":\"已停止\"}";
         }
 
         internal static string Redraw(string user, int index, bool force)

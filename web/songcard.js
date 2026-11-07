@@ -347,7 +347,7 @@ function renderChartBody(song, sheet) {
     + '<div class="sm-action-row"><button class="sm-bl" data-act="score-edit">编辑成绩</button>'
     + '<button class="sm-bl sm-fav' + (sheet.favorite ? " on" : "") + '" data-act="fav-toggle">'
     + (sheet.favorite ? "取消收藏" : "加入收藏") + "</button>"
-    + '<button class="sm-bl sm-push" data-act="push-machine">推送到机台</button></div>'
+    + '<button class="sm-bl sm-push" data-act="push-machine">推送到机台</button></div><p id="sm-push-message" class="hint" role="status" aria-live="polite"></p>'
     + "</div>"
     + "</div>";
 }
@@ -667,6 +667,11 @@ async function pushToMachine() {
   const { song, sheet } = BL_PENDING;
   const isUtage = song.family === "utage" || song.family === "utage2p";
   const chartType = song.family === "dx" ? "dx" : (song.family === "std" ? "std" : "");
+  const message = document.getElementById("sm-push-message");
+  const button = document.querySelector('[data-act="push-machine"]');
+  if (button?.disabled) return;
+  if (button) button.disabled = true;
+  if (message) message.textContent = "正在推送到机台…";
   try {
     const data = await api("/api/assistant/push", {
       method: "POST", headers: {"Content-Type": "application/json"},
@@ -678,9 +683,13 @@ async function pushToMachine() {
       }),
     });
     if (data && data.ok === false) throw new Error(data.error || data.info || "推送失败");
+    if (message) message.textContent = data.msg || data.info || "已推送到机台";
   } catch (err) {
     const msg = String(err.message || err);
-    alert(msg.indexOf("局域网IP") >= 0 ? msg : "推送失败：" + msg);
+    if (message) message.textContent = "推送失败：" + msg;
+    else alert("推送失败：" + msg);
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 

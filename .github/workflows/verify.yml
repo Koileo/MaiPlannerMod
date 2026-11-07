@@ -21,7 +21,7 @@ jobs:
       - name: C# regression checks
         shell: pwsh
         run: |
-          foreach ($project in 'VerifyRuntime', 'VerifyLogic', 'VerifyStats', 'VerifyEndToEnd', 'VerifyAnalysis') {
+          foreach ($project in 'VerifyRuntime', 'VerifyAssistant', 'VerifyLogic', 'VerifyStats', 'VerifyEndToEnd', 'VerifyAnalysis') {
             dotnet run --project "verify/$project.csproj" -c Release
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }

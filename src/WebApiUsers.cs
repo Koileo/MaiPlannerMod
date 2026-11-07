@@ -19,6 +19,7 @@ namespace MaiPlanner
             bool first = true;
             foreach (var p in PlayerStore.All)
             {
+                if (!p.IsEntry) continue;
                 if (!first)
                 {
                     sb.Append(',');
