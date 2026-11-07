@@ -1,0 +1,1600 @@
+using MelonLoader;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Linq;
+using System.Reflection;
+using HarmonyLib;
+using Manager;
+using MAI2.Util;
+using MAI2System;
+using Process;
+using UnityEngine;
+
+namespace MaiPlanner
+{
+    /// <summary>
+    /// 抓 MusicSelectProcess 实例。
+    /// 跳曲用的是游戏自己的公开 API:
+    ///   CurrentCategorySelect / CurrentMusicSelect / ScoreType / CurrentDifficulty / DifficultySelectIndex
+    ///   ChangeBGM() / CombineMusicDataList / MonitorArray[i].SetScrollMusicCard|SetScrollGenreCard|OutGenreTab
+    /// 换画面: 子序列数组切到 SubSequence.Difficulty(=3, 难度选择画面)。
+    /// 注: 游戏里 `Process.SubSequence` 既是枚举名又是命名空间名(SequenceBase 在那个命名空间里),
+    /// 静态引用必撞, 所以子序列那几个 private 数组一律反射拿、反射调, 不给编译器机会。
+    /// </summary>
+    [HarmonyPatch(typeof(MusicSelectProcess), "OnStart")]
+    internal static class Patch_SelectOnStart
+    {
+        private static void Postfix(MusicSelectProcess __instance)
+        {
+            SelectDriver.Capture(__instance);
+        }
+    }
+
+    [HarmonyPatch(typeof(MusicSelectProcess), "OnRelease")]
+    internal static class Patch_SelectOnRelease
+    {
+        private static void Postfix()
+        {
+            SelectDriver.Release();
+        }
+    }
+
+    internal static class SelectDriver
+    {
+        /// <summary>子序列下标(MusicSelectProcess.SubSequence): Music=0, Genre=1, SortSetting=2,
+        /// Difficulty=3, UtageDifficulty=4, Menu=5, Option=6, Character=7</summary>
+        private const int SubSeqMusic = 0;
+        private const int SubSeqDifficulty = 3;
+        private const int SubSeqUtageDifficulty = 4;
+        private static readonly string[] SubSeqNames =
+            { "选曲列表", "分类选择", "排序设置", "难度选择", "宴会场难度选择", "菜单", "选项", "角色选择" };
+        /// <summary>MusicSelectProcess._mainSequence 里的 Update(=3): 只有这时才能点歌, 进场/退场动画中不能动</summary>
+        private const int MainSeqUpdate = 3;
+        /// <summary>跟游戏自己确认选曲时一样, 切画面期间锁输入这么久</summary>
+        private const float InputLockMs = 1200f;
+        /// <summary>游戏还在锁输入(切画面动画中)时, 点歌请求最多等这么久再执行</summary>
+        private const int DeferMaxMs = 3000;
+
+        /// <summary>被后面的点歌取代的请求, 结果以这个前缀开头(Web 转成 superseded, 网页不当错误)</summary>
+        internal const string SupersededPrefix = "SUPERSEDED:";
+
+        private static MusicSelectProcess _process;
+        private static Array _subSeqArray;    // SequenceBase[player][]
+        private static Array _curSeq;         // SubSequence[player]
+        private static Array _prevSeq;        // SubSequence[player]
+        private static FieldInfo _fSubSeqArray;
+        private static FieldInfo _fCurSeq;
+        private static FieldInfo _fPrevSeq;
+        private static FieldInfo _fMainSeq;
+        private static MethodInfo _mSyncNext;
+        /// <summary>主线程每帧更新的"在不在选曲界面"(给网页线程读, 网页线程不能自己去查游戏对象)</summary>
+        private static volatile bool _inSelectCached;
+
+        /// <summary>网页线程塞进来、主线程执行的请求</summary>
+        private sealed class Request
+        {
+            public int MusicId;
+            public int Difficulty;   // -1 = 自动(最高可用)
+            public int ScoreKind = -1;   // 谱面类型: -1 = 自动(按点的 id 判断, 优先 DX), 0 = STD, 1 = DX
+            public bool Random;
+            public int RandomDiff = -1;
+            public string Result;
+            public bool Done;
+            public int QueuedAt = Environment.TickCount;
+            public readonly object Lock = new object();
+        }
+
+        /// <summary>正在等游戏解锁输入的那一个请求(只留最新的)</summary>
+        private static Request _deferred;
+        /// <summary>切到难度画面的协程还没跑完(协程万一没跑, 3 秒后自动作废, 免得之后的点歌一直在等)</summary>
+        private static bool _switchPending;
+        private static int _switchPendingAt;
+        /// <summary>正在执行一次点歌跳转</summary>
+        private static bool _jumpInFlight;
+
+        /// <summary>
+        /// 点歌链路正忙(排队中 / 正在跳 / 等切画面)。
+        /// 主线程上的其它重活(整表重探重出、曲绘编码)看到它就往后让一让 ——
+        /// 叠在同一帧上就是玩家感觉到的"点歌时卡一下"。
+        /// </summary>
+        internal static bool Busy
+        {
+            get
+            {
+                if (_jumpInFlight || _switchPending)
+                {
+                    return true;
+                }
+                lock (_queueLock)
+                {
+                    return _queue.Count > 0 || _deferred != null;
+                }
+            }
+        }
+
+        private static readonly List<Request> _queue = new List<Request>();
+        private static readonly object _queueLock = new object();
+
+        // ── 自动验证（调试用，不参与正常点歌） ──
+        private static int _autoTestId;
+        private static int _autoTestDiff = -1;
+        internal static string LastJumpResult = "";
+        internal static string LastJumpAt = "";
+
+        /// <summary>等下次进入选曲界面时自动跳一首, 结果记在 LastJumpResult</summary>
+        internal static void ArmAutoTest(int musicId, int difficulty)
+        {
+            _autoTestId = musicId;
+            _autoTestDiff = difficulty;
+            LastJumpResult = "(已布防: 进选曲界面就点 " + musicId + " / "
+                + SongTable.DifficultyName(difficulty) + ")";
+            LastJumpAt = DateTime.Now.ToString("HH:mm:ss");
+        }
+
+        /// <summary>自检用: 各环节状态</summary>
+        internal static string Diagnostics()
+        {
+            var sb = new System.Text.StringBuilder();
+            bool inSelect = InSelect;   // 会顺手触发兜底查找
+            sb.Append("{\"inSelect\":").Append(inSelect ? "true" : "false");
+            sb.Append(",\"process\":").Append(_process != null ? "true" : "false");
+            sb.Append(",\"subSeqCaptured\":").Append(_subSeqArray != null ? "true" : "false");
+            int cats = -1;
+            int items = 0;
+            try
+            {
+                if (_process != null && _process.CombineMusicDataList != null)
+                {
+                    cats = _process.CombineMusicDataList.Count;
+                    for (int i = 0; i < cats; i++)
+                    {
+                        items += _process.CombineMusicDataList[i].Count;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            sb.Append(",\"categories\":").Append(cats);
+            sb.Append(",\"items\":").Append(items);
+            sb.Append(",\"cursorId\":").Append(CursorMusicId);
+            sb.Append(",\"cursorDiff\":").Append(CursorDifficulty);
+            sb.Append(",\"armed\":").Append(_autoTestId > 0 ? _autoTestId.ToString() : "0");
+            sb.Append(",\"lastJump\":\"").Append(SongTable.Escape(LastJumpResult)).Append('"');
+            sb.Append(",\"lastJumpAt\":\"").Append(SongTable.Escape(LastJumpAt)).Append('"');
+            sb.Append(",\"songTable\":").Append(SongTable.DiagJson());
+            sb.Append('}');
+            return sb.ToString();
+        }
+
+        internal static void Capture(MusicSelectProcess process)
+        {
+            // 游戏进选曲界面时 OnStart 会按玩家人数各触发一次(1P/2P), 同一个实例会来两次;
+            // 只在"真的换了实例"时打日志, 免得一进选曲界面就刷两行重复的
+            bool sameInstance = ReferenceEquals(_process, process);
+            _process = process;
+            _switchPending = false;
+            ResetPlayableCache();
+            try
+            {
+                if (_fSubSeqArray == null)
+                {
+                    _fSubSeqArray = AccessTools.Field(typeof(MusicSelectProcess), "_subSequenceArray");
+                    _fCurSeq = AccessTools.Field(typeof(MusicSelectProcess), "_currentPlayerSubSequence");
+                    _fPrevSeq = AccessTools.Field(typeof(MusicSelectProcess), "_beforePlayerSubSequence");
+                    _fMainSeq = AccessTools.Field(typeof(MusicSelectProcess), "_mainSequence");
+                    // 游戏自己切子画面用的 SyncNext(SubSequence): Reset 当前 -> 记 before -> 切过去 -> OnStartSequence, 所有玩家一起
+                    _mSyncNext = AccessTools.Method(typeof(MusicSelectProcess), "SyncNext");
+                }
+                _subSeqArray = _fSubSeqArray == null ? null : (Array)_fSubSeqArray.GetValue(process);
+                _curSeq = _fCurSeq == null ? null : (Array)_fCurSeq.GetValue(process);
+                _prevSeq = _fPrevSeq == null ? null : (Array)_fPrevSeq.GetValue(process);
+            }
+            catch (Exception e)
+            {
+                ModLog.WarnOnce("取子序列数组失败(不影响点歌, 只是不会自动跳难度画面): " + e.Message);
+                _subSeqArray = null;
+            }
+            if (!sameInstance)
+            {
+                ModLog.Info("MusicSelectProcess 已捕获, 曲目分类 "
+                    + (process.CombineMusicDataList == null ? -1 : process.CombineMusicDataList.Count) + " 组, 子序列="
+                    + (_subSeqArray != null));
+            }
+        }
+
+        internal static void Release()
+        {
+            // 同 Capture: OnRelease 也会按玩家人数各来一次, 只在真的释放时打一行
+            if (_process == null)
+            {
+                return;
+            }
+            _process = null;
+            _subSeqArray = null;
+            _curSeq = null;
+            _prevSeq = null;
+            _switchPending = false;
+            _inSelectCached = false;
+            ModLog.Info("MusicSelectProcess 已释放");
+        }
+
+        /// <summary>只能在主线程用(会碰游戏对象); 网页线程用 InSelectCached</summary>
+        internal static bool InSelect
+        {
+            get
+            {
+                if (_process == null || _process.CombineMusicDataList == null)
+                {
+                    TryFindProcess();
+                }
+                return _process != null && _process.CombineMusicDataList != null;
+            }
+        }
+
+        /// <summary>网页线程可读: 主线程最近一次看到的"在不在选曲界面"</summary>
+        internal static bool InSelectCached
+        {
+            get { return _inSelectCached; }
+        }
+
+        /// <summary>主线程每帧调用, 刷新给网页线程看的缓存</summary>
+        internal static void UpdateCache()
+        {
+            _inSelectCached = InSelect;
+            VerifyScoreKind();
+            SongTable.Tick();
+        }
+
+        /// <summary>
+        /// 点歌后的下一帧读一次游戏的 ScoreType: 确认 DX/标准 真的生效了。
+        /// 只在没生效时打 Error(默认日志级别就能看见), 免得刷日志。
+        /// </summary>
+        private static void VerifyScoreKind()
+        {
+            if (_verifyKind < 0 || Environment.TickCount - _verifyAt < 60)
+            {
+                return;
+            }
+            int want = _verifyKind;
+            _verifyKind = -1;
+            try
+            {
+                if (!InSelect || _process == null)
+                {
+                    return;
+                }
+                int now = (int)_process.ScoreType;
+                if (now != want)
+                {
+                    // 切画面后游戏可能复位；这里再压一次，避免只报错不纠。
+                    try
+                    {
+                        ApplyScoreKind(want);
+                    }
+                    catch
+                    {
+                    }
+                    ModLog.ErrorOnce("谱面类型没生效: 想要 "
+                        + (want == 1 ? "DX" : "STD") + ", 游戏里现在是 "
+                        + (now == 1 ? "DX" : "STD") + " (曲目 id " + _verifyTypeId
+                        + ", 卡片 id " + _verifyRealId + ") —— 已强制重设");
+                }
+                else
+                {
+                    ModLog.Info("谱面类型确认: " + (now == 1 ? "DX" : "STD")
+                        + " (曲目 id " + _verifyTypeId + ", 卡片 id " + _verifyRealId + ")");
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static int _verifyKind = -1;
+        private static int _pendingKind = -1;
+        private static int _verifyTypeId;
+        private static int _verifyRealId;
+        private static int _verifyAt;
+
+        private static float _findCooldown;
+        private static object _lastMonitor;
+
+        /// <summary>
+        /// 选曲列表快照(给 SongTable 当数据源①用): 游戏自己建好的可点歌曲表,
+        /// 每条里有 msDetailData.musicId 和 musicSelectData[STD/DX].MusicData(真 MusicData 对象)。
+        /// 没进过选曲界面(或已释放)时返回 null —— 调用方要能优雅跳过。
+        /// </summary>
+        internal static List<ReadOnlyCollection<MusicSelectProcess.CombineMusicSelectData>> SelectList
+        {
+            get
+            {
+                try
+                {
+                    return InSelect ? _process.CombineMusicDataList : null;
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 兜底: 万一时序上没接到 OnStart(或以后游戏改了方法名), 就从场景里活的
+        /// MusicSelectMonitor 反查它的 MusicSelectProcess 字段把实例捞回来。
+        /// </summary>
+        private static void TryFindProcess()
+        {
+            if (!MainThread.IsMain)
+            {
+                return;   // FindObjectOfType / Time 都是 Unity API, 只能主线程调
+            }
+            try
+            {
+                if (Time.unscaledTime < _findCooldown)
+                {
+                    return;
+                }
+                _findCooldown = Time.unscaledTime + 1f;
+                Monitor.MusicSelectMonitor mon =
+                    UnityEngine.Object.FindObjectOfType<Monitor.MusicSelectMonitor>();
+                if (mon == null || mon == _lastMonitor)
+                {
+                    return;
+                }
+                _lastMonitor = mon;
+                object proc = null;
+                FieldInfo[] fields = typeof(Monitor.MusicSelectMonitor).GetFields(
+                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                foreach (FieldInfo f in fields)
+                {
+                    if (typeof(MusicSelectProcess).IsAssignableFrom(f.FieldType))
+                    {
+                        proc = f.GetValue(mon);
+                        if (proc != null)
+                        {
+                            ModLog.Info("兜底找到选曲进程, 字段 " + f.Name);
+                            break;
+                        }
+                    }
+                }
+                if (proc is MusicSelectProcess)
+                {
+                    Capture((MusicSelectProcess)proc);
+                }
+            }
+            catch (Exception e)
+            {
+                ModLog.Info("兜底找进程失败: " + e.Message);
+            }
+        }
+
+        /// <summary>当前光标所在曲目 id(None 返回 -1)</summary>
+        internal static int CursorMusicId
+        {
+            get
+            {
+                try
+                {
+                    if (!InSelect)
+                    {
+                        return -1;
+                    }
+                    // 只读属性: 绝不在这里改游戏画面状态。
+                    // 以前这里会调 EnsureInMusicList() 把画面切回歌曲列表, 而网页/其它模块是每帧轮询这个值的,
+                    // 结果玩家一停在其他画面(比如 START 页、演出结束后的页面)就被硬拉回列表 —— 和别的 mod 的演出撞上就是死循环。
+                    var list = _process.CombineMusicDataList;
+                    int c = _process.CurrentCategorySelect;
+                    int m = _process.CurrentMusicSelect;
+                    if (c < 0 || c >= list.Count)
+                    {
+                        return -1;
+                    }
+                    if (m < 0 || m >= list[c].Count)
+                    {
+                        return -1;
+                    }
+                    return list[c][m].msDetailData.musicId;
+                }
+                catch
+                {
+                    return -1;
+                }
+            }
+        }
+
+        internal static int CursorDifficulty
+        {
+            get
+            {
+                try
+                {
+                    return InSelect ? _process.GetCurrentDifficulty(0) : -1;
+                }
+                catch
+                {
+                    return -1;
+                }
+            }
+        }
+
+        /// <summary>诊断用: 手动切 STD/DX 后读游戏当前真实状态, 不改任何东西。</summary>
+        internal static string ProbeJson()
+        {
+            if (!InSelect || _process == null)
+            {
+                return "{\"ready\":false}";
+            }
+            try
+            {
+                var card = _process.GetCombineMusic(0);
+                int realId = -1;
+                int id0 = -1;
+                int id1 = -1;
+                bool std = false;
+                bool dx = false;
+                bool can = false;
+                if (card != null)
+                {
+                    realId = card.msDetailData == null ? -1 : card.msDetailData.musicId;
+                    id0 = SlotId(card, 0);
+                    id1 = SlotId(card, 1);
+                    std = card.existStandardScore;
+                    dx = card.existDeluxeScore;
+                    can = card.isChangeScoreKind();
+                }
+                return "{\"ready\":true"
+                    + ",\"scoreType\":" + (int)_process.ScoreType
+                    + ",\"realId\":" + realId
+                    + ",\"id0\":" + id0
+                    + ",\"id1\":" + id1
+                    + ",\"existStd\":" + (std ? "true" : "false")
+                    + ",\"existDx\":" + (dx ? "true" : "false")
+                    + ",\"canChange\":" + (can ? "true" : "false")
+                    + ",\"category\":" + _process.CurrentCategorySelect
+                    + ",\"index\":" + _process.CurrentMusicSelect
+                    + ",\"difficulty\":" + _process.GetCurrentDifficulty(0)
+                    + ",\"cursorId\":" + CursorMusicId
+                    + "}";
+            }
+            catch (Exception e)
+            {
+                return "{\"ready\":false,\"error\":\"" + e.Message.Replace("\\", "\\\\").Replace("\"", "'") + "\"}";
+            }
+        }
+
+        // ── 网页 -> 主线程 ────────────────────────────────────────────
+
+        /// <summary>
+        /// STD / DX 类型表(直接读游戏自己的选曲数据结构, 最准):
+        ///   CombineMusicSelectData.existStandardScore / existDeluxeScore
+        /// 返回 曲目 id -> 0=只有标准 1=只有 DX 2=两种都有。没进过选曲界面时返回空表。
+        /// </summary>
+        internal static Dictionary<int, int> ScoreTypeMap()
+        {
+            Dictionary<int, int> map = new Dictionary<int, int>();
+            try
+            {
+                if (!InSelect)
+                {
+                    return map;
+                }
+                var list = _process.CombineMusicDataList;
+                for (int cat = 0; cat < list.Count; cat++)
+                {
+                    var page = list[cat];
+                    for (int i = 0; i < page.Count; i++)
+                    {
+                        var c = page[i];
+                        if (c == null || c.msDetailData == null)
+                        {
+                            continue;
+                        }
+                        int id = c.msDetailData.musicId;
+                        if (id <= 0)
+                        {
+                            continue;
+                        }
+                        int v = 0;
+                        if (c.existStandardScore)
+                        {
+                            v |= 1;
+                        }
+                        if (c.existDeluxeScore)
+                        {
+                            v |= 2;
+                        }
+                        map[id] = v == 0 ? (id >= 10000 ? 2 : 1) : v;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                ModLog.Info("读 STD/DX 类型失败: " + e.Message);
+            }
+            return map;
+        }
+
+        /// <summary>
+        /// 每首曲子的"这档谱到底能不能玩" —— 直读游戏选曲数据里的
+        /// CombineMusicSelectData.musicSelectData[ScoreType].isExistsScore[5]。
+        /// 这才是游戏自己判断用的值(XML 里的 isEnable 只是声明, 谱面文件缺失/版本没同步时
+        /// 游戏仍然认为不存在 -> 会把你点的 Re:MASTER 悄悄退成 MASTER)。
+        /// 返回 曲目 id -> bool[5]; 没进过选曲界面时返回空表。
+        /// </summary>
+        internal static Dictionary<int, bool[]> PlayableMap()
+        {
+            Dictionary<int, bool[]> map = new Dictionary<int, bool[]>();
+            try
+            {
+                if (!InSelect)
+                {
+                    return map;
+                }
+                var list = _process.CombineMusicDataList;
+                for (int cat = 0; cat < list.Count; cat++)
+                {
+                    var page = list[cat];
+                    if (page == null)
+                    {
+                        continue;
+                    }
+                    for (int i = 0; i < page.Count; i++)
+                    {
+                        var c = page[i];
+                        if (c == null || c.msDetailData == null || c.musicSelectData == null)
+                        {
+                            continue;
+                        }
+                        int detailId = c.msDetailData.musicId;
+                        // STD / DX 两个槽都要读: 只读当前 ScoreType 那一个槽的话, 另一边的曲子拿不到真值
+                        for (int s = 0; s < c.musicSelectData.Count; s++)
+                        {
+                            var msd = c.musicSelectData[s];
+                            if (msd == null)
+                            {
+                                continue;
+                            }
+                            bool[] arr = ExistsScore(msd);
+                            if (arr == null)
+                            {
+                                continue;
+                            }
+                            int id = detailId;
+                            try
+                            {
+                                if (msd.MusicData != null && msd.MusicData.GetID() > 0)
+                                {
+                                    id = msd.MusicData.GetID();
+                                }
+                            }
+                            catch
+                            {
+                            }
+                            if (id > 0)
+                            {
+                                map[id] = arr;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                ModLog.Info("读可玩谱面表失败: " + e.Message);
+            }
+            return map;
+        }
+
+        /// <summary>
+        /// 取 MusicSelectData.isExistsScore —— 这档谱到底存不存在(游戏自己的真值)。
+        /// 注意: 这个字段在 1.70 是 List&lt;bool&gt;, 老代码写的是 `as bool[]` → 永远是 null,
+        /// 于是"游戏真值"这条路一直静默失效、白读一遍。这里 bool[] / List&lt;bool&gt; / IList 都认。
+        /// </summary>
+        private static bool[] ExistsScore(MusicSelectProcess.MusicSelectData msd)
+        {
+            try
+            {
+                if (_fExistsScore == null)
+                {
+                    _fExistsScore = msd.GetType().GetField("isExistsScore",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                }
+                if (_fExistsScore == null)
+                {
+                    return null;
+                }
+                object raw = _fExistsScore.GetValue(msd);
+                var arr = raw as bool[];
+                if (arr != null)
+                {
+                    return arr;
+                }
+                var list = raw as List<bool>;
+                if (list != null)
+                {
+                    return list.ToArray();
+                }
+                var any = raw as IList;
+                if (any != null && any.Count > 0)
+                {
+                    bool[] r = new bool[any.Count];
+                    for (int i = 0; i < any.Count; i++)
+                    {
+                        r[i] = Convert.ToBoolean(any[i]);
+                    }
+                    return r;
+                }
+            }
+            catch
+            {
+            }
+            return null;
+        }
+
+        private static FieldInfo _fExistsScore;
+        private static Dictionary<int, bool[]> _playable;
+
+        /// <summary>选曲列表变了(进选曲界面 / 重建曲目表)时丢掉"能不能玩"缓存, 下次用到再按当前列表重算</summary>
+        internal static void ResetPlayableCache()
+        {
+            _playable = null;
+        }
+
+        /// <summary>该曲该难度游戏是否认为可玩(null=还不知道, 那就按 XML 的来)</summary>
+        internal static bool? GamePlayable(int musicId, int diff)
+        {
+            try
+            {
+                var playable = _playable;
+                if (playable == null)
+                {
+                    playable = PlayableMap();
+                    // 没在选曲界面时拿到的是空表, 不缓存, 等进了选曲界面再算
+                    _playable = playable.Count > 0 ? playable : null;
+                }
+                if (playable.Count == 0)
+                {
+                    return null;
+                }
+                bool[] arr;
+                if (!playable.TryGetValue(musicId, out arr) || arr == null)
+                {
+                    return null;
+                }
+                if (diff < 0 || diff >= arr.Length)
+                {
+                    return false;
+                }
+                return arr[diff];
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        internal static string Enqueue(int musicId, int difficulty)
+        {
+            return Enqueue(musicId, difficulty, -1);
+        }
+
+        /// <summary>入队点歌。scoreKind: -1 = 自动(按点的 id 判断, 优先 DX), 0 = STD, 1 = DX</summary>
+        internal static string Enqueue(int musicId, int difficulty, int scoreKind)
+        {
+            Request r = new Request();
+            r.MusicId = musicId;
+            r.Difficulty = difficulty;
+            r.ScoreKind = (scoreKind == 0 || scoreKind == 1) ? scoreKind : -1;
+            lock (_queueLock)
+            {
+                _queue.Add(r);
+            }
+            // 最多等 5 秒(主线程每帧都会来取; 游戏在切画面时最多再等 3 秒)
+            WaitResult(r, 5000);
+            return r.Result;
+        }
+
+        internal static string EnqueueRandom(int difficulty)
+        {
+            Request r = new Request();
+            r.Random = true;
+            r.RandomDiff = difficulty;
+            lock (_queueLock)
+            {
+                _queue.Add(r);
+            }
+            WaitResult(r, 5000);
+            return r.Result;
+        }
+
+        private static void WaitResult(Request r, int ms)
+        {
+            lock (r.Lock)
+            {
+                if (!r.Done)
+                {
+                    System.Threading.Monitor.Wait(r.Lock, ms);
+                }
+            }
+        }
+
+        internal static void RunPending()
+        {
+            // 自动验证：进入选曲界面后自动点一首（调试用，用来确认跳转链路）
+            if (_autoTestId > 0 && InSelect)
+            {
+                int id = _autoTestId;
+                int diff = _autoTestDiff;
+                _autoTestId = 0;
+                try
+                {
+                    LastJumpResult = Jump(id, diff);
+                }
+                catch (Exception e)
+                {
+                    LastJumpResult = "自动验证异常: " + e.Message;
+                }
+                LastJumpAt = DateTime.Now.ToString("HH:mm:ss");
+                ModLog.Info("自动点歌验证: " + LastJumpResult);
+            }
+
+            Request[] batch = null;
+            lock (_queueLock)
+            {
+                if (_queue.Count > 0)
+                {
+                    batch = _queue.ToArray();
+                    _queue.Clear();
+                }
+            }
+            // 连点只执行最新的一个: 以前同一帧里把排队的请求全执行一遍(每个都 ChangeBGM + 切画面),
+            // 连点几下就把选曲界面搅乱。前面的直接回"被取代"。
+            if (batch != null)
+            {
+                Request newest = batch[batch.Length - 1];
+                for (int i = 0; i < batch.Length - 1; i++)
+                {
+                    Complete(batch[i], SupersededPrefix + "已被后面的点歌取代");
+                }
+                if (_deferred != null && _deferred != newest)
+                {
+                    Complete(_deferred, SupersededPrefix + "已被后面的点歌取代");
+                }
+                _deferred = newest;
+            }
+            Request r = _deferred;
+            if (r == null)
+            {
+                return;
+            }
+            if (_switchPending && unchecked(Environment.TickCount - _switchPendingAt) > DeferMaxMs)
+            {
+                _switchPending = false;
+            }
+            // 游戏正在切画面(锁着输入)或上一次跳转还没切完: 先等, 别在动画中间改状态
+            if (_switchPending || AnyInputLocked())
+            {
+                if (unchecked(Environment.TickCount - r.QueuedAt) < DeferMaxMs)
+                {
+                    return;
+                }
+                _deferred = null;
+                Complete(r, "游戏正在切换画面, 请稍后再点");
+                return;
+            }
+            _deferred = null;
+            string msg;
+            try
+            {
+                msg = r.Random ? JumpRandom(r.RandomDiff) : Jump(r.MusicId, r.Difficulty, r.ScoreKind);
+            }
+            catch (Exception e)
+            {
+                msg = "点歌失败: " + e.Message;
+                ModLog.WarnOnce("点歌异常: " + e);
+            }
+            Complete(r, msg);
+        }
+
+        private static void Complete(Request r, string msg)
+        {
+            lock (r.Lock)
+            {
+                r.Result = msg;
+                r.Done = true;
+                System.Threading.Monitor.PulseAll(r.Lock);
+            }
+        }
+
+        /// <summary>有登录的玩家里, 有没有谁正被游戏锁着输入(切画面动画中)</summary>
+        private static bool AnyInputLocked()
+        {
+            try
+            {
+                if (_process == null)
+                {
+                    return false;
+                }
+                for (int p = 0; p < _process.MonitorArray.Length; p++)
+                {
+                    if (IsEntry(p) && _process.IsInputLocking(p))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
+        /// <summary>现在能不能点歌; 不能就返回原因</summary>
+        private static string BlockReason()
+        {
+            try
+            {
+                if (_fMainSeq != null && Convert.ToInt32(_fMainSeq.GetValue(_process)) != MainSeqUpdate)
+                {
+                    return "选曲界面还在进场/退场, 请稍后再点";
+                }
+                if (_curSeq != null)
+                {
+                    for (int p = 0; p < _curSeq.Length && p < _process.MonitorArray.Length; p++)
+                    {
+                        if (!IsEntry(p))
+                        {
+                            continue;
+                        }
+                        int cur = Convert.ToInt32(_curSeq.GetValue(p));
+                        // 分类/等级分类页(1=Genre, 2=SortSetting)也允许点歌: 跳转里会先帮你切回列表
+                        bool inCategory = cur == 1 || cur == 2;
+                        if (!inCategory && cur != SubSeqMusic && cur != SubSeqDifficulty && cur != SubSeqUtageDifficulty)
+                        {
+                            string where = cur >= 0 && cur < SubSeqNames.Length ? SubSeqNames[cur] : ("画面 " + cur);
+                            return "游戏现在在「" + where + "」, 请先回到选曲列表再点歌";
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                ModLog.Info("读选曲状态失败: " + e.Message);
+            }
+            return null;
+        }
+
+
+        /// <summary>点歌时如果还在"歌曲分类/等级分类"页, 先按游戏自己的确认流程切进歌曲列表。</summary>
+        private static void EnsureInMusicList()
+        {
+            try
+            {
+                if (_curSeq == null || _mSyncNext == null)
+                {
+                    return;
+                }
+                for (int p = 0; p < _curSeq.Length; p++)
+                {
+                    if (!IsEntry(p))
+                    {
+                        continue;
+                    }
+                    int cur = Convert.ToInt32(_curSeq.GetValue(p));
+                    if (cur != SubSeqMusic && cur != SubSeqDifficulty && cur != SubSeqUtageDifficulty)
+                    {
+                        SyncNext(SubSeqMusic);
+                        return;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                ModLog.Info("切回选曲列表失败(不影响点歌): " + e.Message);
+            }
+        }
+
+        /// <summary>有登录的玩家里, 有没有谁已经在(宴会场)难度画面</summary>
+        private static bool AnyInDifficulty()
+        {
+            try
+            {
+                if (_curSeq == null)
+                {
+                    return false;
+                }
+                for (int p = 0; p < _curSeq.Length && p < _process.MonitorArray.Length; p++)
+                {
+                    int cur = Convert.ToInt32(_curSeq.GetValue(p));
+                    if (IsEntry(p) && (cur == SubSeqDifficulty || cur == SubSeqUtageDifficulty))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
+        /// <summary>调游戏自己的 SyncNext(子画面)</summary>
+        private static bool SyncNext(int subSeq)
+        {
+            if (_mSyncNext == null || _curSeq == null)
+            {
+                return false;
+            }
+            System.Type enumType = _curSeq.GetType().GetElementType();
+            _mSyncNext.Invoke(_process, new object[] { Enum.ToObject(enumType, subSeq) });
+            return true;
+        }
+
+        // ── 核心: 跳到某曲某难度 ──────────────────────────────────────
+        internal static string Jump(int musicId, int difficulty)
+        {
+            return Jump(musicId, difficulty, -1);
+        }
+
+        /// <summary>跳到指定曲目/难度。scoreKind: -1 = 自动(按点的 id 判断, 优先 DX), 0 = STD, 1 = DX</summary>
+        internal static string Jump(int musicId, int difficulty, int scoreKind)
+        {
+            _jumpInFlight = true;
+            System.Diagnostics.Stopwatch swAll = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                return JumpInner(musicId, difficulty, scoreKind);
+            }
+            finally
+            {
+                _jumpInFlight = false;
+                Perf.Hit("jump", swAll.Elapsed.TotalMilliseconds);
+            }
+        }
+
+        /// <summary>取走这段耗时并重新计时(给分阶段计时用)</summary>
+        private static double Mark(System.Diagnostics.Stopwatch sw)
+        {
+            double ms = sw.Elapsed.TotalMilliseconds;
+            sw.Restart();
+            return ms;
+        }
+
+        /// <summary>
+        /// 像玩家按切换键一样切 STD/DX。直接写 ScoreType 只改枚举，
+        /// 部分版本不会刷新选曲卡/难度页；ScoreKindMove() 才是游戏的正式入口。
+        /// </summary>
+        private static void ApplyScoreKind(int kind)
+        {
+            try
+            {
+                if (_process != null)
+                {
+                    _process.ScoreType = (ConstParameter.ScoreKind)kind;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static string JumpInner(int musicId, int difficulty, int scoreKind)
+        {
+            if (!InSelect)
+            {
+                return "当前不在选曲界面(先回到选曲画面再点歌)";
+            }
+            // 点歌时如果还停在"歌曲分类/等级分类"页, 先按游戏自己的确认流程切进歌曲列表。
+            // (以前这句挂在 CursorMusicId 只读属性上, 网页每帧轮询就会把玩家从别的画面硬拉回列表, 已移除)
+            EnsureInMusicList();
+            string blocked = BlockReason();
+            if (blocked != null)
+            {
+                return blocked;
+            }
+            var list = _process.CombineMusicDataList;
+            int oldCat = _process.CurrentCategorySelect;
+            int oldIdx = _process.CurrentMusicSelect;
+            bool onlySpecial = false;
+            System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int cat = 0; cat < list.Count; cat++)
+            {
+                int idx = FindInCategory(list[cat], musicId);
+                if (idx < 0)
+                {
+                    continue;
+                }
+                // 同一首歌会出现在好几个分类里; 对战(ghost)/挑战/段位/联机/推荐 这类特殊资料夹会触发特殊玩法,
+                // 先临时选中看看是不是特殊资料夹, 是就换下一个分类(宴会场的歌只在宴会场资料夹里, 允许)
+                _process.CurrentCategorySelect = cat;
+                _process.CurrentMusicSelect = idx;
+                if (IsSpecialHere())
+                {
+                    onlySpecial = true;
+                    continue;
+                }
+                var hit = list[cat][idx];
+                int realId = hit.msDetailData.musicId;
+                // 谱面类型(DX/标准): 游戏里"一首歌只有一张卡", DX/STD 靠 ScoreType 切换,
+                // 所以必须按用户点的那首来定, 不能按找到的卡片 id 来定 —— 旧代码写的是
+                // (realId >= 10000 ? 1 : 0), 而点 DX 行时是靠 id%10000 找到 STD 那张卡,
+                // realId 于是是 STD 的小 id, 永远算成 STD。表现就是"点不了 DX 谱"。
+                int kind = ResolveScoreKind(hit, musicId, realId, scoreKind);
+                // 难度/可玩性要按这个类型的曲目 id 查(两边的谱面档位不一样, 例如 DX 才有 Re:MASTER)
+                int typeId = TypeIdOf(hit, kind, musicId, realId);
+
+                // 已经在难度画面: 先按游戏自己"返回"的做法退回选曲列表, 再换曲子重新进难度画面。
+                // 以前直接在难度画面上再切一次难度画面, before 会被记成难度画面自己, 之后按返回就回不去了。
+                if (AnyInDifficulty())
+                {
+                    for (int p = 0; p < _process.DifficultySelectIndex.Length; p++)
+                    {
+                        _process.DifficultySelectIndex[p] = -1;
+                    }
+                    SyncNext(SubSeqMusic);
+                }
+
+                // 再设一次: 上面从难度画面退回选曲列表时, 游戏的 OnStartSequence 可能动过光标
+                _process.CurrentCategorySelect = cat;
+                _process.CurrentMusicSelect = idx;
+                Perf.Hit("jump.find", Mark(sw));
+                ApplyScoreKind(kind);
+                _process.ChangeBGM();
+                Perf.Hit("jump.bgm", Mark(sw));   // 换 BGM: 游戏自己要加载/解码预览音频
+
+                // 先让游戏按新曲目重算一遍监视器数据 —— CalcMonitorDifficulty 内部会按曲子默认值
+                // 覆写 DifficultySelectIndex, 所以必须放在"设难度"之前, 否则难度会被顶掉。
+                try
+                {
+                    _process.CalcMonitorDifficulty(true);
+                }
+                catch (Exception e)
+                {
+                    ModLog.Info("CalcMonitorDifficulty 失败(不影响跳转): " + e.Message);
+                }
+
+                // 再写难度(UI 每帧读 GetCurrentDifficulty -> 会把难度条刷到我们指定的那个)。
+                // 顺手确认 ScoreType 没被上面的 ChangeBGM / CalcMonitorDifficulty 复位。
+                ApplyScoreKind(kind);
+                _verifyKind = kind;
+                _verifyTypeId = typeId;
+                _verifyRealId = realId;
+                _verifyAt = Environment.TickCount;
+                Perf.Hit("jump.calc", Mark(sw));   // CalcMonitorDifficulty: 重算监视器数据(可能顺带加载曲绘)
+                int applied = ApplyDifficulty(typeId, difficulty);
+                Perf.Hit("jump.diff", Mark(sw));   // 写难度 + 可玩性判定
+
+                if (Config.JumpToDifficultyScreen && _mSyncNext != null)
+                {
+                    // 跟游戏自己确认选曲时一样: 收起曲目卡/分类页签、换按钮图、锁输入, 下一帧切到难度画面
+                    Monitor.MusicSelectMonitor first = null;
+                    for (int p = 0; p < _process.MonitorArray.Length; p++)
+                    {
+                        Monitor.MusicSelectMonitor mon = _process.MonitorArray[p];
+                        if (mon == null || !IsEntry(p))
+                        {
+                            continue;
+                        }
+                        if (first == null)
+                        {
+                            first = mon;
+                        }
+                        try
+                        {
+                            mon.ChangeButtonImage(InputManager.ButtonSetting.Button04, 14);
+                        }
+                        catch
+                        {
+                        }
+                        mon.SetScrollMusicCard(false);
+                        mon.OutGenreTab();
+                        _process.SetInputLockInfo(p, InputLockMs);
+                    }
+                    if (first != null)
+                    {
+                        _switchPending = true;
+                        _switchPendingAt = Environment.TickCount;
+                        _pendingKind = kind;
+                        first.StartCoroutine(NextFrame());
+                    }
+                }
+
+                string name = SongTable.NameOf(typeId);
+                string dname = SongTable.DifficultyName(applied);
+                string tname = kind == 1 ? "DX" : "STD";
+                Perf.Hit("jump.setup", Mark(sw));   // 收卡片/页签 + 锁输入 + 起协程
+                ModLog.Info("点歌: " + typeId + " " + name + " / " + tname + " " + dname
+                    + " (卡 id " + realId + ", 分类 " + cat + " 第 " + idx + " 首)");
+                if (_lastClampedFrom >= 0)
+                {
+                    return "已跳转: " + name + " [" + tname + " " + dname + "] (该曲 "
+                        + SongTable.DifficultyName(_lastClampedFrom) + " 这个版本不能玩, 游戏自己退到 "
+                        + dname + ")";
+                }
+                return "已跳转: " + name + " [" + tname + " " + dname + "]";
+            }
+            // 没点成: 光标放回原处
+            _process.CurrentCategorySelect = oldCat;
+            _process.CurrentMusicSelect = oldIdx;
+            if (onlySpecial)
+            {
+                return "这首歌只在特殊分类(对战/挑战/段位/联机等)里, 为免触发特殊玩法不自动跳转, 请在游戏里手动选";
+            }
+            return "找不到这首歌: " + musicId + " —— 它可能刚热导入还没进选曲列表(回一次标题再进选曲界面即可), 或者被游戏过滤/未开放";
+        }
+
+        /// <summary>取卡片里第 slot 套谱面(STD=0 / DX=1)对应的曲目 id; 拿不到返回 -1</summary>
+        private static int SlotId(MusicSelectProcess.CombineMusicSelectData card, int slot)
+        {
+            try
+            {
+                if (card == null || card.musicSelectData == null)
+                {
+                    return -1;
+                }
+                if (slot < 0 || slot >= card.musicSelectData.Count)
+                {
+                    return -1;
+                }
+                var msd = card.musicSelectData[slot];
+                if (msd == null || msd.MusicData == null)
+                {
+                    return -1;
+                }
+                int id = msd.MusicData.GetID();
+                return id > 0 ? id : -1;
+            }
+            catch
+            {
+                return -1;
+            }
+        }
+
+        /// <summary>
+        /// 决定这张卡切 DX 还是 STD(0=STD, 1=DX)。判定顺序:
+        ///   1. 网页明确指定了(0/1)就用指定的;
+        ///   2. 卡片里哪一套的曲目 id 正好等于用户点的 id —— 精确命中(点 DX 行就是 DX);
+        ///   3. 按用户点的那首的类型(两种都有 -> 默认 DX, 跟着玩家习惯);
+        ///   4. 都没有就按 id 约定(id &gt;= 10000 是 DX)。
+        /// 最后再看卡片上到底有没有这种谱面, 没有就退回另一种(免得进去是空的)。
+        /// </summary>
+        private static int ResolveScoreKind(MusicSelectProcess.CombineMusicSelectData card, int wantId, int realId, int scoreKind)
+        {
+            int idStd = SlotId(card, 0);
+            int idDx = SlotId(card, 1);
+            bool cardStd, cardDx;
+            if (idStd > 0 || idDx > 0)
+            {
+                // 不同版本/整合包会把 STD/DX 两个槽的顺序放反；按 id 约定判断，
+                // 不要盲目相信 musicSelectData[0] 一定是 STD。
+                cardStd = (idStd > 0 && idStd < 10000) || (idDx > 0 && idDx < 10000);
+                cardDx = (idDx > 0 && idDx >= 10000) || (idStd > 0 && idStd >= 10000);
+            }
+            else
+            {
+                try
+                {
+                    SongTable.TypeOf(realId, out cardStd, out cardDx);
+                }
+                catch
+                {
+                    cardStd = true;
+                    cardDx = true;
+                }
+            }
+            int kind = -1;
+            if (scoreKind == 0 || scoreKind == 1)
+            {
+                kind = scoreKind;
+            }
+            if (kind < 0 && idStd > 0 && idStd == wantId)
+            {
+                kind = 0;
+            }
+            if (kind < 0 && idDx > 0 && idDx == wantId)
+            {
+                kind = 1;
+            }
+            if (kind < 0)
+            {
+                bool wantStd, wantDx;
+                try
+                {
+                    SongTable.TypeOf(wantId, out wantStd, out wantDx);
+                }
+                catch
+                {
+                    wantDx = wantId >= 10000;
+                    wantStd = !wantDx;
+                }
+                if (wantDx && !wantStd)
+                {
+                    kind = 1;
+                }
+                else if (wantStd && !wantDx)
+                {
+                    kind = 0;
+                }
+                else if (wantStd && wantDx)
+                {
+                    // 两种都有: 看点进来的是哪一套的 id(DX 行的 id 在 10000 以上)
+                    kind = wantId >= 10000 ? 1 : 0;
+                }
+                else
+                {
+                    kind = wantId >= 10000 ? 1 : 0;
+                }
+            }
+            ModLog.Info("类型解析: want=" + scoreKind + " id0=" + idStd + " id1=" + idDx + " cardStd=" + cardStd + " cardDx=" + cardDx + " -> kind=" + kind);
+            if (scoreKind < 0)
+            {
+                // 只有自动判断时才按卡片槽位兜底。
+                // 玩家明确要 STD/DX 时，游戏里可能两个槽都是同一个 MusicData
+                // 但靠 ScoreType 切换；这时候绝不能把明确的 std 再改回 dx。
+                if (kind == 1 && !cardDx && cardStd)
+                {
+                    kind = 0;
+                }
+                else if (kind == 0 && !cardStd && cardDx)
+                {
+                    kind = 1;
+                }
+            }
+            ModLog.Info("类型解析最终: want=" + scoreKind + " kind=" + kind);
+            return kind;
+        }
+
+        /// <summary>这个类型对应的曲目 id(查难度 / 能不能玩用它; STD 和 DX 的 id 不是同一个)</summary>
+        private static int TypeIdOf(MusicSelectProcess.CombineMusicSelectData card, int kind, int wantId, int realId)
+        {
+            // 请求本身已经带了明确类型时，优先用请求 id：
+            // STD 请求的小 id / DX 请求的 10000+ id 就是游戏该用的曲目 id。
+            // 有些整合包把 card.musicSelectData 两个槽都指向 DX MusicData，
+            // 这时槽位 id 会误导难度/曲目查询（例如请求 146 却被当成 10146）。
+            if (kind == 0 && wantId > 0 && wantId < 10000)
+            {
+                return wantId;
+            }
+            if (kind == 1 && wantId >= 10000)
+            {
+                return wantId;
+            }
+            int id0 = SlotId(card, 0);
+            int id1 = SlotId(card, 1);
+            int id = -1;
+            if (kind == 0)
+            {
+                if (id0 > 0 && id0 < 10000) id = id0;
+                else if (id1 > 0 && id1 < 10000) id = id1;
+            }
+            else
+            {
+                if (id1 > 0 && id1 >= 10000) id = id1;
+                else if (id0 > 0 && id0 >= 10000) id = id0;
+            }
+            // 槽顺序不可靠：按 id 约定没找到时才退回原来的槽位假设
+            if (id <= 0) id = kind == 1 ? id1 : id0;
+            if (id > 0)
+            {
+                return id;
+            }
+            bool wStd, wDx;
+            try
+            {
+                SongTable.TypeOf(wantId, out wStd, out wDx);
+            }
+            catch
+            {
+                wDx = wantId >= 10000;
+                wStd = !wDx;
+            }
+            if (kind == 1 && wDx)
+            {
+                return wantId;
+            }
+            if (kind == 0 && wStd)
+            {
+                return wantId;
+            }
+            // 类型和点进来的 id 对不上(例如对标准行点了 type=dx): 按 id 约定推
+            if (kind == 1)
+            {
+                return wantId + 10000;
+            }
+            return wantId >= 10000 ? wantId - 10000 : realId;
+        }
+
+        private static bool HasKindSlot(MusicSelectProcess.CombineMusicSelectData card, bool wantDx)
+        {
+            int a = SlotId(card, 0);
+            int b = SlotId(card, 1);
+            if (wantDx)
+            {
+                return a >= 10000 || b >= 10000;
+            }
+            return (a > 0 && a < 10000) || (b > 0 && b < 10000);
+        }
+
+        /// <summary>在一个分类里找这首歌(DX 找不到就试同曲的标准 id), 跳过空格子和"随机"格; 找不到返回 -1</summary>
+        private static int FindInCategory(ReadOnlyCollection<MusicSelectProcess.CombineMusicSelectData> page, int musicId)
+        {
+            if (page == null)
+            {
+                return -1;
+            }
+            int alt = musicId >= 10000 ? musicId % 10000 : -1;
+            int altIdx = -1;
+            int exactIdx = -1;
+            int exactSlotIdx = -1;
+            int slotIdx = -1;
+            for (int i = 0; i < page.Count; i++)
+            {
+                var c = page[i];
+                if (c == null || c.msDetailData == null || c.isRandomScore)
+                {
+                    continue;
+                }
+                int id = c.msDetailData.musicId;
+                // 关键：STD/DX 经常是两张不同的卡，但 msDetailData.musicId 可能都写 DX id。
+                // 真正的 STD id 只存在于 musicSelectData 的槽里（probe 里 std 卡是 411）。
+                // 所以先按槽里的真实曲目 id 找，不能只看 msDetailData.musicId。
+                if (slotIdx < 0 && (SlotId(c, 0) == musicId || SlotId(c, 1) == musicId))
+                {
+                    slotIdx = i;
+                }
+                if (id == musicId && HasKindSlot(c, musicId >= 10000))
+                {
+                    if (exactIdx < 0) exactIdx = i;
+                    // 同一首歌可能有多张卡；优先选 musicSelectData 里真的有这个 id 的那张。
+                    if (exactSlotIdx < 0 && (SlotId(c, 0) == musicId || SlotId(c, 1) == musicId))
+                    {
+                        exactSlotIdx = i;
+                    }
+                }
+                if (id == alt && HasKindSlot(c, musicId >= 10000) && altIdx < 0)
+                {
+                    altIdx = i;
+                }
+            }
+            if (slotIdx >= 0)
+            {
+                return slotIdx;
+            }
+            if (exactSlotIdx >= 0)
+            {
+                return exactSlotIdx;
+            }
+            if (exactIdx >= 0)
+            {
+                return exactIdx;
+            }
+            if (altIdx >= 0)
+            {
+                return altIdx;
+            }
+            // 不再按曲名兜底：同一首歌的 DX 卡和 STD 卡往往同名但槽位不同，
+            // 在靠前的分类里先撞到 DX 卡会直接返回，导致永远进不了后面的 STD 卡。
+            // 找不到精确槽位/id 就当作未命中，让外层继续搜下一个分类。
+            return -1;
+        }
+
+        /// <summary>当前选中的格子在不在特殊资料夹(只读分类名, 不改游戏状态)</summary>
+        private static bool IsSpecialHere()
+        {
+            try
+            {
+                if (_process.IsUtageMusicFolder())
+                {
+                    return false;
+                }
+                return _process.IsGhostFolder(0) || _process.IsConnectionFolder() || _process.IsChallengeFolder()
+                    || _process.IsTournamentFolder() || _process.IsExtraFolder(0);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal static string JumpRandom(int difficulty)
+        {
+            if (!InSelect)
+            {
+                return "当前不在选曲界面(先回到选曲画面再点歌)";
+            }
+            try
+            {
+                List<int> pool = SongTable.RandomPool(difficulty);
+                if (pool.Count == 0)
+                {
+                    return "没有可随机的曲目";
+                }
+                int id = pool[UnityEngine.Random.Range(0, pool.Count)];
+                return Jump(id, difficulty);
+            }
+            catch (Exception e)
+            {
+                return "随机失败: " + e.Message;
+            }
+        }
+
+        /// <summary>
+        /// 写难度: 该曲没有这个难度就退到最高可用难度。
+        /// CurrentDifficulty 是 UI 当前显示的难度, DifficultySelectIndex 是难度条上的位置, 两个都写。
+        /// </summary>
+        private static int ApplyDifficulty(int musicId, int difficulty)
+        {
+            // 能不能选以游戏自己的判断为准(选曲数据 isExistsScore), 拿不到才看 XML 的 isEnable。
+            // 不可选就往下退(Re:MASTER -> MASTER -> EXPERT…), 退到哪档会写进返回消息,
+            // 免得再出现"点了 14+ 结果跳到 14"却不知道为什么。
+            int want = difficulty;
+            int d = -1;
+            if (want >= 0 && want <= 4 && Playable(musicId, want))
+            {
+                d = want;
+            }
+            if (d < 0)
+            {
+                for (int i = (want >= 0 && want <= 4) ? want : 4; i >= 0; i--)
+                {
+                    if (Playable(musicId, i))
+                    {
+                        d = i;
+                        break;
+                    }
+                }
+            }
+            if (d < 0)
+            {
+                d = SongTable.HighestEnabled(musicId);
+            }
+            if (d < 0)
+            {
+                d = 3;
+            }
+            _lastClampedFrom = (want >= 0 && want <= 4 && d != want) ? want : -1;
+            for (int p = 0; p < _process.MonitorArray.Length; p++)
+            {
+                if (_process.CurrentDifficulty != null && p < _process.CurrentDifficulty.Length)
+                {
+                    _process.CurrentDifficulty[p] = (MusicDifficultyID)d;
+                }
+                if (_process.DifficultySelectIndex != null && p < _process.DifficultySelectIndex.Length)
+                {
+                    _process.DifficultySelectIndex[p] = d;
+                }
+            }
+            GameManager.SelectDifficultyID[0] = d;
+            if (GameManager.SelectDifficultyID.Length > 1)
+            {
+                GameManager.SelectDifficultyID[1] = d;
+            }
+            // 关键补充: 难度页子序列自己缓存的 difficultyIndex 也要写。
+            // 游戏在难度页按确认时是用它写回 DifficultySelectIndex 的 —— 不写它,
+            // 就会出现"UI 显示 14, 底层还是旧档(最低档)"的现象。
+            try
+            {
+                if (_mDifficultyIndex == null)
+                {
+                    _mDifficultyIndex = AccessTools.Field(
+                        typeof(MusicSelectProcess).Assembly.GetType("Process.SubSequence.DifficultySelectSequence"),
+                        "difficultyIndex");
+                }
+                if (_subSeqArray != null && _mDifficultyIndex != null)
+                {
+                    for (int p = 0; p < _subSeqArray.Length; p++)
+                    {
+                        var seqArray = _subSeqArray.GetValue(p) as Array;
+                        if (seqArray == null) continue;
+                        object seq = seqArray.GetValue((int)MusicSelectProcess.SubSequence.Difficulty);
+                        if (seq == null) continue;
+                        _mDifficultyIndex.SetValue(seq, (MusicDifficultyID)d);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                ModLog.Info("写难度页 difficultyIndex 失败(不影响点歌): " + e.Message);
+            }
+            // 「按等级」分页(IsLevelTab)下, 同一首歌每个难度在列表里是**一个格子**(LV3 一个、LV14 一个…),
+            // 游戏自己(在列表里用 1/8 键改难度)的做法是 GetLevelToListPositoin 找到那个格子、把光标移过去,
+            // 而不是改曲目数据 —— 改数据会让 LV3 分区里的卡片显示成 MASTER 14(玩家看到的"跑到别的区域")。
+            try
+            {
+                if (_process.IsLevelTab(0))
+                {
+                    int id = 0;
+                    var combo = _process.GetCombineMusic(0);
+                    if (combo != null)
+                    {
+                        id = combo.GetID(_process.ScoreType);
+                    }
+                    if (id > 0)
+                    {
+                        var position = _process.GetLevelToListPositoin(id, d);
+                        if (position != null)
+                        {
+                            _process.CurrentCategorySelect = position.Category;
+                            _process.CurrentMusicSelect = position.Index;
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                ModLog.Info("定位难度格子失败(不影响点歌): " + e.Message);
+            }
+            return d;
+        }
+
+        private static int _lastClampedFrom = -1;
+        private static FieldInfo _mDifficultyIndex;
+
+        /// <summary>这档谱能不能玩: 游戏说不能就是不能, 游戏还不知道才看 XML 的声明</summary>
+        private static bool Playable(int musicId, int diff)
+        {
+            bool? g = GamePlayable(musicId, diff);
+            return g.HasValue ? g.Value : SongTable.DifficultyEnabled(musicId, diff);
+        }
+
+        private static bool IsEntry(int playerIndex)
+        {
+            try
+            {
+                var ud = Singleton<UserDataManager>.Instance.GetUserData((long)playerIndex);
+                return ud != null && ud.IsEntry;
+            }
+            catch
+            {
+                return playerIndex == 0;
+            }
+        }
+
+        /// <summary>下一帧再切画面: 跟游戏自己换子序列的做法一致, 免得跟当帧的 Update 打架</summary>
+        private static IEnumerator NextFrame()
+        {
+            yield return null;
+            System.Diagnostics.Stopwatch swSwitch = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                if (_process != null && _process.CombineMusicDataList != null && BlockReason() == null)
+                {
+                    bool utage = false;
+                    try
+                    {
+                        utage = _process.IsUtageMusicFolder();
+                    }
+                    catch
+                    {
+                    }
+                    SyncNext(utage ? SubSeqUtageDifficulty : SubSeqDifficulty);
+                    // SyncNext 会让游戏重走 OnStartSequence；部分版本会把 ScoreType
+                    // 复位成卡片默认值，这里在切到难度画面后重新压一次。
+                    if (_verifyKind >= 0)
+                    {
+                        ApplyScoreKind(_verifyKind);
+                    }
+                    else if (_pendingKind >= 0)
+                    {
+                        ApplyScoreKind(_pendingKind);
+                    }
+                    _pendingKind = -1;
+                    ModLog.Info("已切到" + (utage ? "宴会场" : "") + "难度选择画面");
+                }
+            }
+            catch (Exception e)
+            {
+                ModLog.WarnOnce("切难度画面失败: " + e.Message);
+            }
+            finally
+            {
+                _switchPending = false;
+                Perf.Hit("jump.switch", swSwitch.Elapsed.TotalMilliseconds);   // 切到难度画面(游戏要建难度界面)
+            }
+        }
+    }
+}

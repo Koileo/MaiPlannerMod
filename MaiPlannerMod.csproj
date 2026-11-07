@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- net48：与 MelonLoader net35 运行时和游戏 Mono 一致 -->
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>MaiPlannerMod</AssemblyName>
+    <RootNamespace>MaiPlanner</RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <Deterministic>false</Deterministic>
+  </PropertyGroup>
+
+  <!-- 游戏目录必须由命令行给：dotnet build MaiPlannerMod.csproj -c Release -p:GameDir=".../SDEZ170/Package" -->
+  <Target Name="CheckGameDir" BeforeTargets="ResolveAssemblyReferences" Condition="'$(GameDir)' == ''">
+    <Error Text="缺 GameDir。用法：dotnet build MaiPlannerMod.csproj -c Release -p:GameDir=&quot;...\SDEZ170\Package&quot;" />
+  </Target>
+
+  <ItemGroup>
+    <!-- verify/ 下是独立的 net8 自检工程，不编进 mod -->
+    <Compile Remove="verify\**\*" />
+    <EmbeddedResource Remove="verify\**\*" />
+    <None Remove="verify\**\*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="MelonLoader"><HintPath>$(GameDir)\MelonLoader\net35\MelonLoader.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(GameDir)\MelonLoader\net35\0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Assembly-CSharp"><HintPath>$(GameDir)\Sinmai_Data\Managed\Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine"><HintPath>$(GameDir)\Sinmai_Data\Managed\UnityEngine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(GameDir)\Sinmai_Data\Managed\UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UIModule"><HintPath>$(GameDir)\Sinmai_Data\Managed\UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(GameDir)\Sinmai_Data\Managed\UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UI"><HintPath>$(GameDir)\Sinmai_Data\Managed\UnityEngine.UI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AssetBundleModule"><HintPath>$(GameDir)\Sinmai_Data\Managed\UnityEngine.AssetBundleModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.ImageConversionModule"><HintPath>$(GameDir)\Sinmai_Data\Managed\UnityEngine.ImageConversionModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.JSONSerializeModule"><HintPath>$(GameDir)\Sinmai_Data\Managed\UnityEngine.JSONSerializeModule.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <!-- 网页资源全部嵌进 DLL：Mods 里只放一个 DLL 就能跑，不用附带 web 目录。
+       资源名把路径分隔符统一成 . （web/scan/index.html → MaiPlanner.web.scan.index.html） -->
+  <ItemGroup>
+    <EmbeddedResource Include="web\**\*">
+      <LogicalName>MaiPlanner.web.$([System.String]::Copy('%(RecursiveDir)').Replace('\','.'))%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>

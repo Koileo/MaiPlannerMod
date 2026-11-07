@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>VerifyStats</AssemblyName>
+    <RootNamespace>MaiPlanner</RootNamespace>
+    <NoWarn>CS0649;CS0169;CS0219;CS0414</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="VerifyStats.cs" />
+    <Compile Include="ModLogStub.cs" />
+    <Compile Include="GameStubs.cs" />
+    <Compile Include="..\src\Stats.cs" />
+    <Compile Include="..\src\DxRating.cs" />
+    <Compile Include="..\src\Analysis.cs" />
+    <Compile Include="..\src\Pools.cs" />
+    <Compile Include="..\src\Rating.cs" />
+    <Compile Include="..\src\Versions.cs" />
+    <Compile Include="..\src\Blacklist.cs" />
+    <Compile Include="..\src\JsonMini.cs" />
+    <Compile Include="..\src\UserFiles.cs" />
+  </ItemGroup>
+</Project>

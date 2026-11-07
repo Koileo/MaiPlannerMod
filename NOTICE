@@ -1,0 +1,31 @@
+# 第三方代码与素材
+
+## 跳曲与主线程调度
+
+src/MainThread.cs、src/SelectDriver.cs 的基础来自 ZCM-X/maimai-song-request：
+https://github.com/ZCM-X/maimai-song-request
+MIT License，Copyright (c) 2026 ZCM-X。完整许可文本保留于 LICENSE。
+
+## 打歌计划器
+
+分析、Rating、曲池逻辑及网页基础来自原 maimai_planner 项目：
+MIT License，Copyright (c) 2026 Akkarin。完整许可文本保留于 LICENSE。
+
+## SortableJS
+
+web/vendor/Sortable.min.js 为 SortableJS 1.15.6（MIT）。
+完整第三方许可保留于 web/vendor/Sortable.LICENSE。
+https://github.com/SortableJS/Sortable
+
+## 社区别名数据
+
+web/aliases.json 是按曲名整理的社区搜索别名，沿用已有点歌项目的数据。
+原始别名来自 SongSearch / MuNET 社区整理，感谢 clansty 与社区贡献者：
+https://github.com/clansty
+数据归原作者和贡献者所有，不作为本项目 MIT 代码重新许可。
+
+## 游戏 UI、字体与曲绘
+
+web/ui/、web/fonts/ 中的游戏相关素材及运行时读取的游戏曲绘，其权利归原权利人所有。
+本项目的 MIT 许可证仅适用于代码，不对这些素材另行授权。
+仓库不包含游戏程序集、游戏程序、MelonLoader 二进制或玩家存档。
